@@ -159,22 +159,6 @@ private:
   autoware_sensing_msgs::msg::GnssInsOrientation ins_orientation_;
 };
 
-// Utility functions of a few specific steps, declared here only because the unit tests that came
-// with the package call them directly.
-
-/// \brief Component-wise median of the buffered positions. The buffer must be non-empty.
-geometry_msgs::msg::Point get_median_position(
-  const boost::circular_buffer<geometry_msgs::msg::Point> & position_buffer);
-
-/// \brief Component-wise mean of the buffered positions. The buffer must be non-empty.
-geometry_msgs::msg::Point get_average_position(
-  const boost::circular_buffer<geometry_msgs::msg::Point> & position_buffer);
-
-/// \brief Yaw-only orientation pointing from `prev_point` to `point` (atan2 of the xy
-/// displacement); identity when the two points coincide.
-geometry_msgs::msg::Quaternion get_quaternion_by_position_difference(
-  const geometry_msgs::msg::Point & point, const geometry_msgs::msg::Point & prev_point);
-
 }  // namespace autoware::gnss_poser
 
 #endif  // GNSS_POSER_HPP_
