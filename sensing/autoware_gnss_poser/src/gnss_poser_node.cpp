@@ -114,31 +114,31 @@ void GnssPoserNode::callback_nav_sat_fix(
       break;
 
     case GnssPoser::Outcome::NotFixed:
-      publish_fixed(false);
+      publish_fixed(nav_sat_fix_msg_ptr->header.stamp, false);
       RCLCPP_WARN_STREAM_THROTTLE(
         this->get_logger(), *this->get_clock(), std::chrono::milliseconds(1000).count(),
         "Not Fixed Topic. Skipping Calculate.");
       break;
 
     case GnssPoser::Outcome::Buffering:
-      publish_fixed(true);
+      publish_fixed(nav_sat_fix_msg_ptr->header.stamp, true);
       RCLCPP_WARN_STREAM_THROTTLE(
         this->get_logger(), *this->get_clock(), std::chrono::milliseconds(1000).count(),
         "Buffering Position. Output Skipped.");
       break;
 
     case GnssPoser::Outcome::Published:
-      publish_fixed(true);
+      publish_fixed(nav_sat_fix_msg_ptr->header.stamp, true);
       publish_pose(nav_sat_fix_msg_ptr->header.stamp, *result.pose_with_covariance);
       break;
   }
 }
 
-void GnssPoserNode::publish_fixed(const bool fixed)
+void GnssPoserNode::publish_fixed(const builtin_interfaces::msg::Time & stamp, const bool fixed)
 {
   // publish is_fixed topic
   auto is_fixed_msg = ALLOCATE_OUTPUT_MESSAGE_UNIQUE(fixed_pub_);
-  is_fixed_msg->stamp = this->now();
+  is_fixed_msg->stamp = stamp;
   is_fixed_msg->data = fixed;
   fixed_pub_->publish(std::move(is_fixed_msg));
 }
