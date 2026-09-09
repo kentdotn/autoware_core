@@ -120,10 +120,6 @@ std::array<double, 36> make_pose_covariance(
   covariance[diagonal_stride * 5] = rotation_variances[2];
   return covariance;
 }
-}  // namespace
-
-// Defined here rather than in the anonymous namespace above, because the unit tests that came
-// with the package call them directly and so the header still declares them.
 
 geometry_msgs::msg::Point get_median_position(
   const boost::circular_buffer<geometry_msgs::msg::Point> & position_buffer)
@@ -183,6 +179,7 @@ geometry_msgs::msg::Quaternion get_quaternion_by_position_difference(
   quaternion.setRPY(0, 0, yaw);
   return tf2::toMsg(quaternion);
 }
+}  // namespace
 
 GnssPoser::GnssPoser(
   const GnssPoserParams & params, TransformLookup lookup_antenna_to_base_link,
