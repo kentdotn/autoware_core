@@ -846,6 +846,43 @@ TEST(GnssPoser, PositionVariancesFromFixOrDefault)
 }
 
 // ---------------------------------------------------------------------------------------------
+// Status
+
+// take_status() reports the configured orientation source, what has arrived, whether the projector
+// is usable, the buffer fill and the latest outcome.
+TEST(GnssPoser, TakeStatusReflectsInputsAndLatestOutcome)
+{
+  GnssPoser poser(make_params(GnssPosePubMethod::Average, 2), identity_lookup);
+
+  const auto initial = poser.take_status();
+  EXPECT_TRUE(initial.use_gnss_ins_orientation);
+  EXPECT_FALSE(initial.projector_info_received);
+  EXPECT_FALSE(initial.projector_is_local);
+  EXPECT_FALSE(initial.ins_orientation_received);
+  EXPECT_EQ(initial.position_buffer_size, 0U);
+  EXPECT_FALSE(initial.latest_outcome.has_value());
+
+  poser.set_projector_info(make_local_projector_info());
+  poser.input_fix(make_reference_fix());
+  const auto local = poser.take_status();
+  EXPECT_TRUE(local.projector_info_received);
+  EXPECT_TRUE(local.projector_is_local);
+  EXPECT_EQ(local.latest_outcome, Outcome::LocalProjector);
+
+  poser.set_projector_info(make_mgrs_projector_info());
+  poser.set_ins_orientation(GnssInsOrientation{});
+  poser.input_fix(make_reference_fix());
+  const auto buffering = poser.take_status();
+  EXPECT_FALSE(buffering.projector_is_local);
+  EXPECT_TRUE(buffering.ins_orientation_received);
+  EXPECT_EQ(buffering.position_buffer_size, 1U);
+  EXPECT_EQ(buffering.latest_outcome, Outcome::Buffering);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stage functions
+
+// ---------------------------------------------------------------------------------------------
 // Projector variants and injected covariance
 
 // The vertical datum of the projector info is honored: with EGM2008 the WGS84 ellipsoid altitude
