@@ -57,9 +57,17 @@ void GnssPoser::set_ins_orientation(
   const autoware_sensing_msgs::msg::GnssInsOrientation & orientation)
 {
   ins_orientation_ = orientation;
+  ins_orientation_received_ = true;
 }
 
 GnssPoser::Result GnssPoser::input_fix(const sensor_msgs::msg::NavSatFix & fix)
+{
+  const Result result = process_fix(fix);
+  latest_outcome_ = result.outcome;
+  return result;
+}
+
+GnssPoser::Result GnssPoser::process_fix(const sensor_msgs::msg::NavSatFix & fix)
 {
   // Return immediately if map_projector_info has not been received yet.
   if (!received_map_projector_info_) {
@@ -133,6 +141,37 @@ GnssPoser::Result GnssPoser::input_fix(const sensor_msgs::msg::NavSatFix & fix)
     compose_base_link_pose(gnss_antenna_pose, antenna_to_base_link);
   gnss_base_pose_with_covariance.covariance = make_pose_covariance(fix, rotation_variances);
   return {Outcome::Published, gnss_base_pose_with_covariance};
+}
+
+GnssPoser::Status GnssPoser::take_status() const
+{
+  Status status;
+  status.use_gnss_ins_orientation = params_.use_gnss_ins_orientation;
+  status.projector_info_received = received_map_projector_info_;
+  status.projector_is_local =
+    received_map_projector_info_ &&
+    projector_info_.projector_type == autoware_map_msgs::msg::MapProjectorInfo::LOCAL;
+  status.ins_orientation_received = ins_orientation_received_;
+  status.position_buffer_size = position_buffer_.size();
+  status.latest_outcome = latest_outcome_;
+  return status;
+}
+
+const char * to_string(const GnssPoser::Outcome outcome)
+{
+  switch (outcome) {
+    case GnssPoser::Outcome::NoProjectorInfo:
+      return "NoProjectorInfo";
+    case GnssPoser::Outcome::LocalProjector:
+      return "LocalProjector";
+    case GnssPoser::Outcome::NotFixed:
+      return "NotFixed";
+    case GnssPoser::Outcome::Buffering:
+      return "Buffering";
+    case GnssPoser::Outcome::Published:
+      return "Published";
+  }
+  return "Unknown";
 }
 
 bool is_fixed(const sensor_msgs::msg::NavSatStatus & nav_sat_status_msg)

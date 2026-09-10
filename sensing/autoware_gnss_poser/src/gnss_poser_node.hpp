@@ -18,6 +18,7 @@
 
 #include <autoware/agnocast_wrapper/node.hpp>
 #include <autoware/agnocast_wrapper/tf2.hpp>
+#include <autoware_utils_diagnostics/diagnostics_interface.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <tf2/transform_datatypes.hpp>
 
@@ -31,6 +32,7 @@
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -66,6 +68,7 @@ private:
   void publish_tf(
     const std::string & frame_id, const std::string & child_frame_id,
     const geometry_msgs::msg::PoseStamped & pose_msg);
+  void publish_diagnostics();
 
   tf2::BufferCore tf2_buffer_;
   autoware::agnocast_wrapper::TransformListener tf2_listener_;
@@ -85,6 +88,16 @@ private:
   const std::string map_frame_;
 
   GnssPoser gnss_poser_;
+
+  // Input facts the logic does not see, reported as diagnostics.
+  std::optional<builtin_interfaces::msg::Time> latest_fix_stamp_;
+  std::string antenna_frame_;                // header.frame_id of the latest fix
+  bool antenna_transform_available_ = true;  // result of the latest TF lookup
+
+  std::unique_ptr<
+    autoware_utils_diagnostics::BasicDiagnosticsInterface<autoware::agnocast_wrapper::Node>>
+    diagnostics_;
+  AUTOWARE_TIMER_PTR diagnostics_timer_;
 };
 }  // namespace autoware::gnss_poser
 

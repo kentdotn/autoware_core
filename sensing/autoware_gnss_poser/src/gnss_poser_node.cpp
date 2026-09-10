@@ -14,8 +14,11 @@
 
 #include "gnss_poser_node.hpp"
 
+#include "gnss_poser_diagnostics.hpp"
+
 #include <autoware_sensing_msgs/msg/gnss_ins_orientation_stamped.hpp>
 
+#include <cmath>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -76,6 +79,13 @@ GnssPoserNode::GnssPoserNode(const rclcpp::NodeOptions & node_options)
     "gnss_pose_cov", rclcpp::QoS{1});
   fixed_pub_ =
     create_publisher<autoware_internal_debug_msgs::msg::BoolStamped>("gnss_fixed", rclcpp::QoS{1});
+
+  diagnostics_ = std::make_unique<
+    autoware_utils_diagnostics::BasicDiagnosticsInterface<autoware::agnocast_wrapper::Node>>(
+    this, "gnss_poser_status");
+  diagnostics_timer_ = autoware::agnocast_wrapper::create_timer(
+    this, this->get_clock(), std::chrono::milliseconds(100),
+    std::bind(&GnssPoserNode::publish_diagnostics, this));
 }
 
 GnssPoserParams GnssPoserNode::declare_gnss_poser_params()
@@ -97,6 +107,8 @@ void GnssPoserNode::callback_map_projector_info(
 void GnssPoserNode::callback_nav_sat_fix(
   const AUTOWARE_MESSAGE_CONST_SHARED_PTR(sensor_msgs::msg::NavSatFix) & nav_sat_fix_msg_ptr)
 {
+  latest_fix_stamp_ = nav_sat_fix_msg_ptr->header.stamp;
+  antenna_frame_ = nav_sat_fix_msg_ptr->header.frame_id;
   const GnssPoser::Result result = gnss_poser_.input_fix(*nav_sat_fix_msg_ptr);
 
   switch (result.outcome) {
@@ -179,16 +191,21 @@ std::optional<geometry_msgs::msg::Transform> GnssPoserNode::get_static_transform
   const builtin_interfaces::msg::Time & stamp)
 {
   if (target_frame == source_frame) {
+    antenna_transform_available_ = true;
     return geometry_msgs::msg::Transform{};  // identity: zero translation, rotation w = 1
   }
 
   try {
-    return tf2_buffer_
-      .lookupTransform(
-        target_frame, source_frame,
-        tf2::TimePoint(std::chrono::seconds(stamp.sec) + std::chrono::nanoseconds(stamp.nanosec)))
-      .transform;
+    const geometry_msgs::msg::Transform transform =
+      tf2_buffer_
+        .lookupTransform(
+          target_frame, source_frame,
+          tf2::TimePoint(std::chrono::seconds(stamp.sec) + std::chrono::nanoseconds(stamp.nanosec)))
+        .transform;
+    antenna_transform_available_ = true;
+    return transform;
   } catch (tf2::TransformException & ex) {
+    antenna_transform_available_ = false;
     RCLCPP_WARN_STREAM_THROTTLE(
       this->get_logger(), *this->get_clock(), std::chrono::milliseconds(1000).count(), ex.what());
     RCLCPP_WARN_STREAM_THROTTLE(
@@ -196,6 +213,42 @@ std::optional<geometry_msgs::msg::Transform> GnssPoserNode::get_static_transform
       "Please publish TF " << target_frame.c_str() << " to " << source_frame.c_str());
     return std::nullopt;
   }
+}
+
+void GnssPoserNode::publish_diagnostics()
+{
+  const GnssPoser::Status status = gnss_poser_.take_status();
+
+  diagnostics_->clear();
+  diagnostics_->add_key_value("is_arrived_first_fix", latest_fix_stamp_.has_value());
+  diagnostics_->add_key_value(
+    "latest_fix_time_stamp",
+    latest_fix_stamp_ ? rclcpp::Time(*latest_fix_stamp_).seconds() : std::nan(""));
+  diagnostics_->add_key_value(
+    "is_arrived_first_map_projector_info", status.projector_info_received);
+  diagnostics_->add_key_value("is_arrived_first_orientation", status.ins_orientation_received);
+  diagnostics_->add_key_value(
+    "latest_outcome",
+    status.latest_outcome ? std::string(to_string(*status.latest_outcome)) : std::string("None"));
+  diagnostics_->add_key_value("position_buffer_size", status.position_buffer_size);
+  diagnostics_->add_key_value("is_antenna_transform_available", antenna_transform_available_);
+
+  DiagnosticsState state;
+  state.fix_arrived = latest_fix_stamp_.has_value();
+  state.projector_info_received = status.projector_info_received;
+  state.projector_is_local = status.projector_is_local;
+  state.latest_fix_is_fixed = status.latest_outcome != GnssPoser::Outcome::NotFixed;
+  state.use_gnss_ins_orientation = status.use_gnss_ins_orientation;
+  state.ins_orientation_received = status.ins_orientation_received;
+  state.antenna_transform_available = antenna_transform_available_;
+  state.antenna_frame = antenna_frame_;
+  state.base_frame = base_frame_;
+
+  const DiagnosticsResult diagnostics_result = determine_diagnostics(state);
+  for (const auto & entry : diagnostics_result.entries) {
+    diagnostics_->update_level_and_message(entry.level, entry.message);
+  }
+  diagnostics_->publish(this->now());
 }
 
 void GnssPoserNode::publish_tf(

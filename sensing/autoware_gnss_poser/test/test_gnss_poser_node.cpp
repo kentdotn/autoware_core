@@ -40,6 +40,7 @@
 #include <autoware_internal_debug_msgs/msg/bool_stamped.hpp>
 #include <autoware_map_msgs/msg/map_projector_info.hpp>
 #include <autoware_sensing_msgs/msg/gnss_ins_orientation_stamped.hpp>
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <geographic_msgs/msg/geo_point.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
@@ -67,6 +68,8 @@ namespace
 using autoware_internal_debug_msgs::msg::BoolStamped;
 using autoware_map_msgs::msg::MapProjectorInfo;
 using autoware_sensing_msgs::msg::GnssInsOrientationStamped;
+using diagnostic_msgs::msg::DiagnosticArray;
+using diagnostic_msgs::msg::DiagnosticStatus;
 using geometry_msgs::msg::Point;
 using geometry_msgs::msg::PoseStamped;
 using geometry_msgs::msg::PoseWithCovarianceStamped;
@@ -298,6 +301,14 @@ public:
     fixed_sub_ = create_subscription<BoolStamped>(
       "gnss_fixed", rclcpp::QoS{100},
       [this](const BoolStamped::ConstSharedPtr msg) { fixed_flags.push_back(*msg); });
+    diagnostics_sub_ = create_subscription<DiagnosticArray>(
+      "/diagnostics", rclcpp::QoS{100}, [this](const DiagnosticArray::ConstSharedPtr msg) {
+        for (const auto & status : msg->status) {
+          if (status.hardware_id == "gnss_poser") {
+            diagnostics.push_back(status);
+          }
+        }
+      });
     tf_sub_ = create_subscription<TFMessage>(
       "/tf", rclcpp::QoS{100}, [this](const TFMessage::ConstSharedPtr msg) {
         for (const auto & t : msg->transforms) {
@@ -330,6 +341,7 @@ public:
   rclcpp::Subscription<PoseWithCovarianceStamped>::SharedPtr pose_cov_sub_;
   rclcpp::Subscription<BoolStamped>::SharedPtr fixed_sub_;
   rclcpp::Subscription<TFMessage>::SharedPtr tf_sub_;
+  rclcpp::Subscription<DiagnosticArray>::SharedPtr diagnostics_sub_;
   std::shared_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
   std::shared_ptr<tf2_ros::TransformBroadcaster> dynamic_tf_broadcaster_;
   // Observer buffer: used only to know that a TF we broadcast has propagated. It is filled by the
@@ -343,6 +355,7 @@ public:
   std::vector<PoseWithCovarianceStamped> pose_cov_msgs;
   std::vector<BoolStamped> fixed_flags;
   std::vector<TransformStamped> broadcast_tfs;
+  std::vector<DiagnosticStatus> diagnostics;
 };
 
 // Drives the node over its real topics from the test thread. There is no background spin on the
@@ -634,7 +647,8 @@ TEST_F(GnssPoserNodeIntegration, Interface_TopicsAndQos)
            has("/gnss_pose", "geometry_msgs/msg/PoseStamped") &&
            has("/gnss_pose_cov", "geometry_msgs/msg/PoseWithCovarianceStamped") &&
            has("/gnss_fixed", "autoware_internal_debug_msgs/msg/BoolStamped") &&
-           has("/tf", "tf2_msgs/msg/TFMessage");
+           has("/tf", "tf2_msgs/msg/TFMessage") &&
+           has("/diagnostics", "diagnostic_msgs/msg/DiagnosticArray");
   };
   ASSERT_TRUE(pump_until(topics_ready, 10s));
 
@@ -740,6 +754,45 @@ TEST_F(GnssPoserNodeIntegration, Outcome_DrivesWhatIsPublished)
   EXPECT_EQ(tf.header.stamp, fix.header.stamp);
   EXPECT_EQ(tf.header.frame_id, "my_map");
   EXPECT_EQ(tf.child_frame_id, "my_gnss_base_link");
+}
+
+// The diagnostics status `gnss_poser: gnss_poser_status` reflects the input state: WARN while the
+// projector info and the fix are missing, with the corresponding keys False, and OK once a fix has
+// been published with every input present. Which conditions map to which level is unit-tested in
+// test_gnss_poser_diagnostics.cpp; this case checks the wiring to /diagnostics.
+TEST_F(GnssPoserNodeIntegration, Diagnostics_ReflectInputState)
+{
+  ASSERT_NO_FATAL_FAILURE(build_node({}));
+
+  ASSERT_TRUE(pump_until([this] { return !peer_->diagnostics.empty(); }, wait_budget));
+  const auto & before = peer_->diagnostics.back();
+  EXPECT_EQ(before.name, "gnss_poser: gnss_poser_status");
+  EXPECT_EQ(before.level, DiagnosticStatus::WARN);
+  const auto value_of = [](const DiagnosticStatus & status, const std::string & key) {
+    for (const auto & kv : status.values) {
+      if (kv.key == key) {
+        return kv.value;
+      }
+    }
+    return std::string("<missing>");
+  };
+  EXPECT_EQ(value_of(before, "is_arrived_first_fix"), "False");
+  EXPECT_EQ(value_of(before, "is_arrived_first_map_projector_info"), "False");
+  EXPECT_EQ(value_of(before, "latest_outcome"), "None");
+
+  send_projector_info(make_mgrs_projector_info());
+  send_orientation(make_orientation(0.0));
+  // The fix is stamped in base_link itself, so the antenna transform is available without TF.
+  send_fix(make_reference_fix(NavSatStatus::STATUS_FIX, "base_link"));
+  ASSERT_NO_FATAL_FAILURE(wait_for_outputs(1));
+  peer_->diagnostics.clear();
+  ASSERT_TRUE(pump_until([this] { return !peer_->diagnostics.empty(); }, wait_budget));
+  const auto & after = peer_->diagnostics.back();
+  EXPECT_EQ(after.level, DiagnosticStatus::OK);
+  EXPECT_EQ(value_of(after, "is_arrived_first_fix"), "True");
+  EXPECT_EQ(value_of(after, "is_arrived_first_orientation"), "True");
+  EXPECT_EQ(value_of(after, "latest_outcome"), "Published");
+  EXPECT_EQ(value_of(after, "is_antenna_transform_available"), "True");
 }
 
 // =======================================================================================
