@@ -29,6 +29,20 @@ If the transformation from `base_link` to the antenna cannot be obtained, it out
 | `~/output/gnss_pose_cov` | `geometry_msgs::msg::PoseWithCovarianceStamped`  | vehicle pose with covariance calculated from gnss sensing data |
 | `~/output/gnss_fixed`    | `autoware_internal_debug_msgs::msg::BoolStamped` | gnss fix status                                                |
 
+## Diagnostics
+
+The node publishes one status, `gnss_poser: gnss_poser_status`, on `/diagnostics` every 100 ms.
+
+| Name                                  | Description                                                                                  | Transition condition to Warning         | Transition condition to Error |
+| ------------------------------------- | -------------------------------------------------------------------------------------------- | --------------------------------------- | ----------------------------- |
+| `is_arrived_first_fix`                | whether a NavSatFix has been received at least once.                                         | not arrived yet                         | none                          |
+| `latest_fix_time_stamp`               | header stamp of the latest NavSatFix. [second]                                               | none                                    | none                          |
+| `is_arrived_first_map_projector_info` | whether `map_projector_info` has been received at least once.                                | not arrived yet                         | none                          |
+| `is_arrived_first_orientation`        | whether `autoware_orientation` has been received at least once.                              | not arrived yet while `use_gnss_ins_orientation` is true (the identity orientation is used) | none |
+| `latest_outcome`                      | what the latest NavSatFix produced: `NoProjectorInfo`, `LocalProjector`, `NotFixed`, `Buffering` or `Published`. | `NotFixed`               | `LocalProjector`              |
+| `position_buffer_size`                | number of positions in the averaging / median buffer.                                        | none                                    | none                          |
+| `is_antenna_transform_available`      | whether the latest TF lookup from the antenna frame to `base_frame` succeeded.               | none                                    | failed (the antenna pose is published as the base_link pose) |
+
 ## Parameters
 
 Parameters in below table
