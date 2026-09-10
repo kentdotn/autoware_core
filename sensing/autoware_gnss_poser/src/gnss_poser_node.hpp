@@ -61,6 +61,11 @@ private:
   std::optional<geometry_msgs::msg::Transform> get_static_transform(
     const std::string & target_frame, const std::string & source_frame,
     const builtin_interfaces::msg::Time & stamp);
+  // Publish and log what became of a fix. `first_report` is true for the result input_fix() returns
+  // for a fix, so that gnss_fixed is published once per fix even when the pose follows later.
+  void handle_result(const GnssPoser::Result & result, bool first_report);
+  // Process held fixes whose antenna transform became available (or that expired).
+  void drain_pending();
   void publish_fixed(const builtin_interfaces::msg::Time & stamp, bool fixed);
   void publish_pose(
     const builtin_interfaces::msg::Time & stamp,
@@ -98,6 +103,7 @@ private:
     autoware_utils_diagnostics::BasicDiagnosticsInterface<autoware::agnocast_wrapper::Node>>
     diagnostics_;
   AUTOWARE_TIMER_PTR diagnostics_timer_;
+  AUTOWARE_TIMER_PTR pending_timer_;
 };
 }  // namespace autoware::gnss_poser
 

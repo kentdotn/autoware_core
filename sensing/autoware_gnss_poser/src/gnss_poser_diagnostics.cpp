@@ -44,7 +44,7 @@ DiagnosticsResult determine_diagnostics(const DiagnosticsState & state)
       DiagnosticStatus::ERROR,
       "map_projector_info is local projector type. Unable to convert GNSS pose.");
   }
-  if (!state.latest_fix_is_fixed) {
+  if (state.latest_fix_is_fixed && !*state.latest_fix_is_fixed) {
     raise(DiagnosticStatus::WARN, "The latest NavSatFix has no position solution (not fixed).");
   }
   if (state.use_gnss_ins_orientation && !state.ins_orientation_received) {
@@ -53,11 +53,15 @@ DiagnosticsResult determine_diagnostics(const DiagnosticsState & state)
       "autoware_orientation has not been received yet. The identity orientation with an rmse of "
       "1.0 rad is used.");
   }
-  if (!state.antenna_transform_available) {
+  if (state.fixes_dropped_for_missing_transform) {
     raise(
-      DiagnosticStatus::ERROR, "Please publish TF " + state.antenna_frame + " to " +
+      DiagnosticStatus::ERROR, "Fixes are dropped because TF " + state.antenna_frame + " to " +
                                  state.base_frame +
-                                 ". The antenna pose is published as the base_link pose.");
+                                 " does not become available. Please publish it.");
+  } else if (state.pending_fix_count > 0) {
+    raise(
+      DiagnosticStatus::WARN, "Waiting for TF " + state.antenna_frame + " to " + state.base_frame +
+                                " (" + std::to_string(state.pending_fix_count) + " fix(es) held).");
   }
   return result;
 }

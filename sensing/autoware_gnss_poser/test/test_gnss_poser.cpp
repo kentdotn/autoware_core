@@ -206,6 +206,21 @@ const GnssPoser::TransformLookup missing_lookup =
     return std::optional<Transform>();
   };
 
+// A lookup that finds the identity transform only while `available` is true.
+GnssPoser::TransformLookup switchable_lookup(const bool & available)
+{
+  return [&available](const std::string &, const builtin_interfaces::msg::Time &) {
+    return available ? std::optional<Transform>(Transform{}) : std::optional<Transform>();
+  };
+}
+
+NavSatFix make_reference_fix_at(int32_t sec, uint32_t nanosec = 0)
+{
+  NavSatFix fix = make_reference_fix();
+  fix.header.stamp = make_stamp(sec, nanosec);
+  return fix;
+}
+
 // A GnssPoser ready to publish: MGRS projector info received, identity lookup unless given.
 GnssPoser make_ready_poser(
   const GnssPoserParams & params = make_params(),
@@ -370,6 +385,16 @@ TEST(GnssPoser, RejectsBuffEpochBelowOne)
     EXPECT_THROW(GnssPoser(make_params(method, -1), identity_lookup), std::invalid_argument);
     EXPECT_NO_THROW(GnssPoser(make_params(method, 1), identity_lookup));
   }
+}
+
+// A negative antenna transform timeout is rejected at construction; zero is allowed.
+TEST(GnssPoser, RejectsNegativeAntennaTransformTimeout)
+{
+  GnssPoserParams params = make_params();
+  params.antenna_transform_timeout_sec = -0.1;
+  EXPECT_THROW(GnssPoser(params, identity_lookup), std::invalid_argument);
+  params.antenna_transform_timeout_sec = 0.0;
+  EXPECT_NO_THROW(GnssPoser(params, identity_lookup));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -651,8 +676,9 @@ TEST(GnssPoser, MotionOrientationWithBufferUsesFilteredPositions)
 // ---------------------------------------------------------------------------------------------
 // Antenna transform
 
-// The lookup receives the fix header frame and stamp, and is called only once a pose is composed.
-TEST(GnssPoser, LookupReceivesFixFrameAndStampOnlyWhenComposing)
+// The lookup receives the fix header frame and stamp. It is called for every fix that passed the
+// gates, not for a fix the gates reject.
+TEST(GnssPoser, LookupReceivesFixFrameAndStampForAcceptedFixes)
 {
   std::vector<std::pair<std::string, builtin_interfaces::msg::Time>> calls;
   GnssPoser poser = make_ready_poser(
@@ -667,13 +693,15 @@ TEST(GnssPoser, LookupReceivesFixFrameAndStampOnlyWhenComposing)
 
   EXPECT_EQ(
     poser.input_fix(make_reference_fix(NavSatStatus::STATUS_NO_FIX)).outcome, Outcome::NotFixed);
-  EXPECT_EQ(poser.input_fix(fix).outcome, Outcome::Buffering);
   EXPECT_TRUE(calls.empty());
 
-  EXPECT_EQ(poser.input_fix(fix).outcome, Outcome::Published);
+  EXPECT_EQ(poser.input_fix(fix).outcome, Outcome::Buffering);
   ASSERT_EQ(calls.size(), 1U);
   EXPECT_EQ(calls[0].first, "antenna_frame");
   EXPECT_EQ(calls[0].second, make_stamp(1234, 5678U));
+
+  EXPECT_EQ(poser.input_fix(fix).outcome, Outcome::Published);
+  EXPECT_EQ(calls.size(), 2U);
 }
 
 // The base_link pose is the antenna pose composed with the looked-up transform: the translation
@@ -694,16 +722,94 @@ TEST(GnssPoser, ComposesAntennaPoseWithLookedUpTransform)
   expect_same_rotation(pose_with_covariance.pose.orientation, yaw_to_quaternion(M_PI / 2.0));
 }
 
-// When the lookup cannot provide the transform, the antenna pose is published as the base_link
-// pose (identity transform).
-TEST(GnssPoser, MissingTransformPublishesAntennaPose)
+// A fix whose transform is not available is held: input_fix() reports Pending with the fix stamp,
+// next_ready() yields nothing while the transform is missing and the pose once it is available.
+TEST(GnssPoser, MissingTransformHoldsTheFixUntilAvailable)
 {
-  GnssPoser poser = make_ready_poser(make_params(), missing_lookup);
+  bool available = false;
+  GnssPoser poser = make_ready_poser(make_params(), switchable_lookup(available));
+  const NavSatFix fix = make_reference_fix();
 
-  const auto pose_with_covariance = published(poser.input_fix(make_reference_fix()));
+  const auto held = poser.input_fix(fix);
+  EXPECT_EQ(held.outcome, Outcome::Pending);
+  EXPECT_EQ(held.stamp, fix.header.stamp);
+  EXPECT_FALSE(held.pose_with_covariance.has_value());
+  EXPECT_FALSE(poser.next_ready().has_value());
+  EXPECT_EQ(poser.take_status().pending_fix_count, 1U);
 
+  available = true;
+  const auto ready = poser.next_ready();
+  ASSERT_TRUE(ready.has_value());
+  EXPECT_EQ(ready->stamp, fix.header.stamp);
   expect_point_near(
-    pose_with_covariance.pose.position, make_point(golden_x, golden_y, reference_altitude));
+    published(*ready).pose.position, make_point(golden_x, golden_y, reference_altitude));
+  EXPECT_FALSE(poser.next_ready().has_value());
+  EXPECT_EQ(poser.take_status().pending_fix_count, 0U);
+}
+
+// A fix arriving while older fixes are held is held too, even if its own transform is available,
+// so that next_ready() hands the fixes out in arrival order.
+TEST(GnssPoser, FixArrivingWhileOthersAreHeldIsHeldToo)
+{
+  bool available = false;
+  GnssPoser poser = make_ready_poser(make_params(), switchable_lookup(available));
+  const NavSatFix first = make_reference_fix_at(1000);
+  const NavSatFix second = make_reference_fix_at(1000, 100000000U);
+
+  EXPECT_EQ(poser.input_fix(first).outcome, Outcome::Pending);
+  available = true;
+  EXPECT_EQ(poser.input_fix(second).outcome, Outcome::Pending);
+
+  const auto out1 = poser.next_ready();
+  const auto out2 = poser.next_ready();
+  ASSERT_TRUE(out1.has_value());
+  ASSERT_TRUE(out2.has_value());
+  EXPECT_EQ(out1->stamp, first.header.stamp);
+  EXPECT_EQ(out1->outcome, Outcome::Published);
+  EXPECT_EQ(out2->stamp, second.header.stamp);
+  EXPECT_EQ(out2->outcome, Outcome::Published);
+  EXPECT_FALSE(poser.next_ready().has_value());
+}
+
+// Held fixes expire by stamp: once a fix newer by more than antenna_transform_timeout_sec has
+// arrived, next_ready() drops them as Expired, oldest first, and keeps the ones still in time.
+TEST(GnssPoser, HeldFixesExpireAgainstTheNewestStamp)
+{
+  GnssPoserParams params = make_params();
+  params.antenna_transform_timeout_sec = 0.5;
+  GnssPoser poser = make_ready_poser(params, missing_lookup);
+
+  EXPECT_EQ(poser.input_fix(make_reference_fix_at(1000, 0)).outcome, Outcome::Pending);
+  EXPECT_EQ(poser.input_fix(make_reference_fix_at(1000, 200000000U)).outcome, Outcome::Pending);
+  EXPECT_FALSE(poser.next_ready().has_value());  // nothing is older than 0.5 s yet
+
+  EXPECT_EQ(poser.input_fix(make_reference_fix_at(1001, 0)).outcome, Outcome::Pending);
+  const auto expired1 = poser.next_ready();
+  const auto expired2 = poser.next_ready();
+  ASSERT_TRUE(expired1.has_value());
+  ASSERT_TRUE(expired2.has_value());
+  EXPECT_EQ(expired1->outcome, Outcome::Expired);
+  EXPECT_EQ(expired1->stamp, make_stamp(1000, 0));
+  EXPECT_EQ(expired2->outcome, Outcome::Expired);
+  EXPECT_EQ(expired2->stamp, make_stamp(1000, 200000000U));
+  EXPECT_FALSE(poser.next_ready().has_value());  // the newest fix is still waiting
+  EXPECT_EQ(poser.take_status().pending_fix_count, 1U);
+}
+
+// The gates are re-evaluated when a held fix is processed: projector info that turned LOCAL in the
+// meantime makes it a LocalProjector outcome instead of a pose.
+TEST(GnssPoser, HeldFixIsGatedAgainWhenProcessed)
+{
+  bool available = false;
+  GnssPoser poser = make_ready_poser(make_params(), switchable_lookup(available));
+  EXPECT_EQ(poser.input_fix(make_reference_fix()).outcome, Outcome::Pending);
+
+  poser.set_projector_info(make_local_projector_info());
+  available = true;
+  const auto result = poser.next_ready();
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->outcome, Outcome::LocalProjector);
+  EXPECT_FALSE(poser.next_ready().has_value());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -738,7 +844,7 @@ TEST(GnssPoser, PositionVariancesFromFixOrDefault)
 // Status
 
 // take_status() reports the configured orientation source, what has arrived, whether the projector
-// is usable, the buffer fill and the latest outcome.
+// is usable, the buffer fill and the outcome of the last evaluated fix.
 TEST(GnssPoser, TakeStatusReflectsInputsAndLatestOutcome)
 {
   GnssPoser poser(make_params(GnssPosePubMethod::Average, 2), identity_lookup);
@@ -766,6 +872,70 @@ TEST(GnssPoser, TakeStatusReflectsInputsAndLatestOutcome)
   EXPECT_TRUE(buffering.ins_orientation_received);
   EXPECT_EQ(buffering.position_buffer_size, 1U);
   EXPECT_EQ(buffering.latest_outcome, Outcome::Buffering);
+}
+
+// A fix that is only held, or dropped because its transform never arrived, was never evaluated: it
+// leaves the latest outcome and the remembered receiver status untouched. Dropping one is reported
+// on its own, until a fix is processed again.
+TEST(GnssPoser, StatusIgnoresHeldAndDroppedFixes)
+{
+  bool available = false;
+  GnssPoserParams params = make_params();
+  params.antenna_transform_timeout_sec = 0.5;
+  GnssPoser poser = make_ready_poser(params, switchable_lookup(available));
+
+  poser.input_fix(make_reference_fix_at(1000, 0));  // NotFixed status below overwrites nothing yet
+  const auto held = poser.take_status();
+  EXPECT_EQ(held.latest_outcome, std::nullopt);
+  EXPECT_EQ(held.latest_fix_is_fixed, std::nullopt);
+  EXPECT_EQ(held.pending_fix_count, 1U);
+  EXPECT_FALSE(held.fixes_dropped_for_missing_transform);
+
+  // A fix 1 s later expires the held one; both are still unevaluated.
+  poser.input_fix(make_reference_fix_at(1001, 0));
+  const auto expired = poser.next_ready();
+  ASSERT_TRUE(expired.has_value());
+  EXPECT_EQ(expired->outcome, Outcome::Expired);
+  const auto dropped = poser.take_status();
+  EXPECT_EQ(dropped.latest_outcome, std::nullopt);
+  EXPECT_EQ(dropped.latest_fix_is_fixed, std::nullopt);
+  EXPECT_TRUE(dropped.fixes_dropped_for_missing_transform);
+
+  // The remaining fix goes through: now there is an outcome, and the drop is no longer reported.
+  available = true;
+  const auto published = poser.next_ready();
+  ASSERT_TRUE(published.has_value());
+  EXPECT_EQ(published->outcome, Outcome::Published);
+  const auto after = poser.take_status();
+  EXPECT_EQ(after.latest_outcome, Outcome::Published);
+  EXPECT_EQ(after.latest_fix_is_fixed, true);
+  EXPECT_FALSE(after.fixes_dropped_for_missing_transform);
+}
+
+// The receiver status is remembered only for a fix that reached the fixed check: one rejected by
+// the projector gates leaves it as it was, so that a fix dropped at a gate cannot be mistaken for
+// a fix with a position solution.
+TEST(GnssPoser, StatusRemembersReceiverStatusOnlyPastTheProjectorGates)
+{
+  GnssPoser poser(make_params(), identity_lookup);
+
+  poser.input_fix(make_reference_fix());  // no projector info yet
+  EXPECT_EQ(poser.take_status().latest_outcome, Outcome::NoProjectorInfo);
+  EXPECT_EQ(poser.take_status().latest_fix_is_fixed, std::nullopt);
+
+  poser.set_projector_info(make_local_projector_info());
+  poser.input_fix(make_reference_fix(NavSatStatus::STATUS_NO_FIX));
+  EXPECT_EQ(poser.take_status().latest_outcome, Outcome::LocalProjector);
+  EXPECT_EQ(poser.take_status().latest_fix_is_fixed, std::nullopt);
+
+  poser.set_projector_info(make_mgrs_projector_info());
+  poser.input_fix(make_reference_fix(NavSatStatus::STATUS_NO_FIX));
+  EXPECT_EQ(poser.take_status().latest_outcome, Outcome::NotFixed);
+  EXPECT_EQ(poser.take_status().latest_fix_is_fixed, false);
+
+  poser.input_fix(make_reference_fix());
+  EXPECT_EQ(poser.take_status().latest_outcome, Outcome::Published);
+  EXPECT_EQ(poser.take_status().latest_fix_is_fixed, true);
 }
 
 // ---------------------------------------------------------------------------------------------

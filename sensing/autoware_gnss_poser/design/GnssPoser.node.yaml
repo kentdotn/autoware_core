@@ -75,3 +75,9 @@ processes:
       - periodic: 100ms
     outcomes:
       - to_output: diagnostics
+  - name: publish_pending_gnss_data
+    trigger_conditions:
+      - periodic: 20ms
+    outcomes:
+      - to_output: gnss_pose
+      - to_output: gnss_pose_cov

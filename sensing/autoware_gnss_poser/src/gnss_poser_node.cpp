@@ -86,6 +86,12 @@ GnssPoserNode::GnssPoserNode(const rclcpp::NodeOptions & node_options)
   diagnostics_timer_ = autoware::agnocast_wrapper::create_timer(
     this, this->get_clock(), std::chrono::milliseconds(100),
     std::bind(&GnssPoserNode::publish_diagnostics, this));
+
+  // Fixes held for their antenna transform are retried on a short period: TF arrival is not
+  // observable through the transform listener, and the period bounds the added latency.
+  pending_timer_ = autoware::agnocast_wrapper::create_timer(
+    this, this->get_clock(), std::chrono::milliseconds(20),
+    std::bind(&GnssPoserNode::drain_pending, this));
 }
 
 GnssPoserParams GnssPoserNode::declare_gnss_poser_params()
@@ -95,6 +101,7 @@ GnssPoserParams GnssPoserNode::declare_gnss_poser_params()
   params.gnss_pose_pub_method =
     to_gnss_pose_pub_method(declare_parameter<int>("gnss_pose_pub_method"));
   params.buff_epoch = declare_parameter<int>("buff_epoch");
+  params.antenna_transform_timeout_sec = declare_parameter<double>("antenna_transform_timeout_sec");
   return params;
 }
 
@@ -109,8 +116,19 @@ void GnssPoserNode::callback_nav_sat_fix(
 {
   latest_fix_stamp_ = nav_sat_fix_msg_ptr->header.stamp;
   antenna_frame_ = nav_sat_fix_msg_ptr->header.frame_id;
-  const GnssPoser::Result result = gnss_poser_.input_fix(*nav_sat_fix_msg_ptr);
+  handle_result(gnss_poser_.input_fix(*nav_sat_fix_msg_ptr), true);
+  drain_pending();
+}
 
+void GnssPoserNode::drain_pending()
+{
+  while (const auto result = gnss_poser_.next_ready()) {
+    handle_result(*result, false);
+  }
+}
+
+void GnssPoserNode::handle_result(const GnssPoser::Result & result, const bool first_report)
+{
   switch (result.outcome) {
     case GnssPoser::Outcome::NoProjectorInfo:
       RCLCPP_WARN_THROTTLE(
@@ -126,22 +144,43 @@ void GnssPoserNode::callback_nav_sat_fix(
       break;
 
     case GnssPoser::Outcome::NotFixed:
-      publish_fixed(nav_sat_fix_msg_ptr->header.stamp, false);
+      if (first_report) {
+        publish_fixed(result.stamp, false);
+      }
       RCLCPP_WARN_STREAM_THROTTLE(
         this->get_logger(), *this->get_clock(), std::chrono::milliseconds(1000).count(),
         "Not Fixed Topic. Skipping Calculate.");
       break;
 
+    case GnssPoser::Outcome::Pending:
+      publish_fixed(result.stamp, true);
+      RCLCPP_WARN_STREAM_THROTTLE(
+        this->get_logger(), *this->get_clock(), std::chrono::milliseconds(1000).count(),
+        "Waiting for TF " << antenna_frame_ << " to " << base_frame_ << ". Output delayed.");
+      break;
+
+    case GnssPoser::Outcome::Expired:
+      RCLCPP_WARN_STREAM_THROTTLE(
+        this->get_logger(), *this->get_clock(), std::chrono::milliseconds(1000).count(),
+        "TF " << antenna_frame_ << " to " << base_frame_
+              << " did not become available in time. Fix dropped. Please publish TF "
+              << antenna_frame_ << " to " << base_frame_);
+      break;
+
     case GnssPoser::Outcome::Buffering:
-      publish_fixed(nav_sat_fix_msg_ptr->header.stamp, true);
+      if (first_report) {
+        publish_fixed(result.stamp, true);
+      }
       RCLCPP_WARN_STREAM_THROTTLE(
         this->get_logger(), *this->get_clock(), std::chrono::milliseconds(1000).count(),
         "Buffering Position. Output Skipped.");
       break;
 
     case GnssPoser::Outcome::Published:
-      publish_fixed(nav_sat_fix_msg_ptr->header.stamp, true);
-      publish_pose(nav_sat_fix_msg_ptr->header.stamp, *result.pose_with_covariance);
+      if (first_report) {
+        publish_fixed(result.stamp, true);
+      }
+      publish_pose(result.stamp, *result.pose_with_covariance);
       break;
   }
 }
@@ -205,12 +244,8 @@ std::optional<geometry_msgs::msg::Transform> GnssPoserNode::get_static_transform
     antenna_transform_available_ = true;
     return transform;
   } catch (tf2::TransformException & ex) {
+    // Not available (yet): the fix is held and retried; the outcome is logged when it is decided.
     antenna_transform_available_ = false;
-    RCLCPP_WARN_STREAM_THROTTLE(
-      this->get_logger(), *this->get_clock(), std::chrono::milliseconds(1000).count(), ex.what());
-    RCLCPP_WARN_STREAM_THROTTLE(
-      this->get_logger(), *this->get_clock(), std::chrono::milliseconds(1000).count(),
-      "Please publish TF " << target_frame.c_str() << " to " << source_frame.c_str());
     return std::nullopt;
   }
 }
@@ -231,16 +266,20 @@ void GnssPoserNode::publish_diagnostics()
     "latest_outcome",
     status.latest_outcome ? std::string(to_string(*status.latest_outcome)) : std::string("None"));
   diagnostics_->add_key_value("position_buffer_size", status.position_buffer_size);
+  diagnostics_->add_key_value("pending_fix_count", status.pending_fix_count);
   diagnostics_->add_key_value("is_antenna_transform_available", antenna_transform_available_);
+  diagnostics_->add_key_value(
+    "is_dropping_fixes_for_missing_transform", status.fixes_dropped_for_missing_transform);
 
   DiagnosticsState state;
   state.fix_arrived = latest_fix_stamp_.has_value();
   state.projector_info_received = status.projector_info_received;
   state.projector_is_local = status.projector_is_local;
-  state.latest_fix_is_fixed = status.latest_outcome != GnssPoser::Outcome::NotFixed;
+  state.latest_fix_is_fixed = status.latest_fix_is_fixed;
   state.use_gnss_ins_orientation = status.use_gnss_ins_orientation;
   state.ins_orientation_received = status.ins_orientation_received;
-  state.antenna_transform_available = antenna_transform_available_;
+  state.pending_fix_count = status.pending_fix_count;
+  state.fixes_dropped_for_missing_transform = status.fixes_dropped_for_missing_transform;
   state.antenna_frame = antenna_frame_;
   state.base_frame = base_frame_;
 

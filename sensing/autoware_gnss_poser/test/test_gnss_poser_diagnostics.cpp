@@ -20,6 +20,7 @@
 
 #include <gtest/gtest.h>
 
+#include <optional>
 #include <string>
 
 namespace
@@ -39,7 +40,6 @@ DiagnosticsState healthy_state()
   state.latest_fix_is_fixed = true;
   state.use_gnss_ins_orientation = true;
   state.ins_orientation_received = true;
-  state.antenna_transform_available = true;
   state.antenna_frame = "gnss_link";
   state.base_frame = "base_link";
   return state;
@@ -108,6 +108,17 @@ TEST(GnssPoserDiagnostics, WarnWhenLatestFixIsNotFixed)
   EXPECT_TRUE(has_message_containing(result, "not fixed"));
 }
 
+// While no fix has reached the fixed check, nothing is reported about the receiver status.
+TEST(GnssPoserDiagnostics, ReceiverStatusUnknownIsNotReported)
+{
+  DiagnosticsState state = healthy_state();
+  state.latest_fix_is_fixed = std::nullopt;
+
+  const DiagnosticsResult result = determine_diagnostics(state);
+
+  EXPECT_EQ(result.level, DiagnosticStatus::OK);
+}
+
 // A local projector makes every fix unusable: error. It supersedes the not-received warning.
 TEST(GnssPoserDiagnostics, ErrorOnLocalProjector)
 {
@@ -121,15 +132,31 @@ TEST(GnssPoserDiagnostics, ErrorOnLocalProjector)
   EXPECT_TRUE(has_message_containing(result, "local projector"));
 }
 
-// An antenna transform TF cannot provide is an error, and the message names both frames.
-TEST(GnssPoserDiagnostics, ErrorOnMissingAntennaTransform)
+// Fixes waiting for their antenna transform are a warning that names both frames and the count.
+TEST(GnssPoserDiagnostics, WarnWhileFixesWaitForAntennaTransform)
 {
   DiagnosticsState state = healthy_state();
-  state.antenna_transform_available = false;
+  state.pending_fix_count = 2;
+
+  const DiagnosticsResult result = determine_diagnostics(state);
+
+  EXPECT_EQ(result.level, DiagnosticStatus::WARN);
+  EXPECT_TRUE(has_message_containing(result, "Waiting for TF gnss_link to base_link"));
+  EXPECT_TRUE(has_message_containing(result, "2 fix(es)"));
+}
+
+// Fixes dropped because their antenna transform never became available are an error, and it
+// supersedes the warning about fixes still waiting.
+TEST(GnssPoserDiagnostics, ErrorWhenFixesAreDropped)
+{
+  DiagnosticsState state = healthy_state();
+  state.pending_fix_count = 1;
+  state.fixes_dropped_for_missing_transform = true;
 
   const DiagnosticsResult result = determine_diagnostics(state);
 
   EXPECT_EQ(result.level, DiagnosticStatus::ERROR);
+  EXPECT_EQ(result.entries.size(), 1U);
   EXPECT_TRUE(has_message_containing(result, "gnss_link to base_link"));
 }
 
@@ -137,8 +164,8 @@ TEST(GnssPoserDiagnostics, ErrorOnMissingAntennaTransform)
 TEST(GnssPoserDiagnostics, AggregatesToMaxSeverity)
 {
   DiagnosticsState state = healthy_state();
-  state.ins_orientation_received = false;     // WARN
-  state.antenna_transform_available = false;  // ERROR
+  state.ins_orientation_received = false;            // WARN
+  state.fixes_dropped_for_missing_transform = true;  // ERROR
 
   const DiagnosticsResult result = determine_diagnostics(state);
 

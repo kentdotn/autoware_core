@@ -38,6 +38,12 @@
           "default": "1",
           "minimum": 1,
           "description": "Number of positions the average / median is taken over (ignored for method 0)"
+        },
+        "antenna_transform_timeout_sec": {
+          "type": "number",
+          "default": "0.5",
+          "minimum": 0.0,
+          "description": "How long a fix may wait for the TF from its antenna frame to base_frame, measured between fix header stamps. A fix still waiting when a fix newer by more than this arrives is dropped."
         }
       },
       "required": [
@@ -46,7 +52,8 @@
         "map_frame",
         "use_gnss_ins_orientation",
         "gnss_pose_pub_method",
-        "buff_epoch"
+        "buff_epoch",
+        "antenna_transform_timeout_sec"
       ]
     }
   },
