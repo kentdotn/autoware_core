@@ -122,13 +122,19 @@ struct NodeParams
   bool use_gnss_ins_orientation = true;
   int gnss_pose_pub_method = 0;
   int buff_epoch = 1;
+  double antenna_transform_timeout_sec = 0.5;
 
-  // The six parameters the node declares, in declaration order.
+  // The seven parameters the node declares, in declaration order.
   static const std::vector<std::string> & names()
   {
     static const std::vector<std::string> parameter_names = {
-      "base_frame",           "gnss_base_frame", "map_frame", "use_gnss_ins_orientation",
-      "gnss_pose_pub_method", "buff_epoch"};
+      "base_frame",
+      "gnss_base_frame",
+      "map_frame",
+      "use_gnss_ins_orientation",
+      "gnss_pose_pub_method",
+      "buff_epoch",
+      "antenna_transform_timeout_sec"};
     return parameter_names;
   }
 
@@ -147,6 +153,7 @@ struct NodeParams
     add("use_gnss_ins_orientation", use_gnss_ins_orientation);
     add("gnss_pose_pub_method", gnss_pose_pub_method);
     add("buff_epoch", buff_epoch);
+    add("antenna_transform_timeout_sec", antenna_transform_timeout_sec);
     return options;
   }
 };
@@ -541,6 +548,7 @@ TEST_F(GnssPoserNodeIntegration, Construct_WithAllParameters_DeclaresThemAndIsNa
   params.use_gnss_ins_orientation = false;
   params.gnss_pose_pub_method = 2;
   params.buff_epoch = 7;
+  params.antenna_transform_timeout_sec = 1.5;
   ASSERT_NO_FATAL_FAILURE(build_node(params));
 
   EXPECT_STREQ(node_->get_name(), "gnss_poser");
@@ -552,6 +560,7 @@ TEST_F(GnssPoserNodeIntegration, Construct_WithAllParameters_DeclaresThemAndIsNa
   EXPECT_EQ(node_->get_parameter("use_gnss_ins_orientation").as_bool(), false);
   EXPECT_EQ(node_->get_parameter("gnss_pose_pub_method").as_int(), 2);
   EXPECT_EQ(node_->get_parameter("buff_epoch").as_int(), 7);
+  EXPECT_DOUBLE_EQ(node_->get_parameter("antenna_transform_timeout_sec").as_double(), 1.5);
 }
 
 // The node declares all six parameters without a built-in default: a configuration that lacks any
@@ -623,6 +632,7 @@ TEST_F(GnssPoserNodeIntegration, Construct_WithShippedParamFile_MatchesDocumente
   EXPECT_TRUE(node->get_parameter("use_gnss_ins_orientation").as_bool());
   EXPECT_EQ(node->get_parameter("gnss_pose_pub_method").as_int(), 0);
   EXPECT_EQ(node->get_parameter("buff_epoch").as_int(), 1);
+  EXPECT_DOUBLE_EQ(node->get_parameter("antenna_transform_timeout_sec").as_double(), 0.5);
 }
 
 // The node's ROS surface: three subscriptions, three publishers and the /tf broadcast, with their
@@ -708,25 +718,29 @@ TEST_F(GnssPoserNodeIntegration, Outcome_DrivesWhatIsPublished)
   params.gnss_base_frame = "my_gnss_base_link";  // the parameters
   ASSERT_NO_FATAL_FAILURE(build_node(params));
 
+  // Every fix is stamped in base_link, so its antenna transform is available without TF.
+  const auto fixed_fix = make_reference_fix(NavSatStatus::STATUS_FIX, "base_link");
+  const auto no_fix = make_reference_fix(NavSatStatus::STATUS_NO_FIX, "base_link");
+
   // NoProjectorInfo: dropped, nothing published.
-  send_fix(make_reference_fix());
+  send_fix(fixed_fix);
   expect_output_counts(0, 0, 0, 0);
 
   // LocalProjector: dropped as well.
   send_projector_info(make_local_projector_info());
-  send_fix(make_reference_fix());
+  send_fix(fixed_fix);
   expect_output_counts(0, 0, 0, 0);
 
   // NotFixed: gnss_fixed = false and nothing else.
   send_projector_info(make_mgrs_projector_info());
   expect_output_counts(0, 0, 0, 0);
-  send_fix(make_reference_fix(NavSatStatus::STATUS_NO_FIX));
+  send_fix(no_fix);
   ASSERT_NO_FATAL_FAILURE(wait_for_gnss_fixed(1));
   expect_output_counts(1, 0, 0, 0);
   EXPECT_FALSE(last_fixed().data);
 
   // Buffering: gnss_fixed = true and nothing else.
-  const auto fix = make_reference_fix();
+  const auto fix = fixed_fix;
   send_fix(fix);
   ASSERT_NO_FATAL_FAILURE(wait_for_gnss_fixed(2));
   expect_output_counts(2, 0, 0, 0);
@@ -793,6 +807,7 @@ TEST_F(GnssPoserNodeIntegration, Diagnostics_ReflectInputState)
   EXPECT_EQ(value_of(after, "is_arrived_first_orientation"), "True");
   EXPECT_EQ(value_of(after, "latest_outcome"), "Published");
   EXPECT_EQ(value_of(after, "is_antenna_transform_available"), "True");
+  EXPECT_EQ(value_of(after, "is_dropping_fixes_for_missing_transform"), "False");
 }
 
 // =======================================================================================
@@ -851,21 +866,17 @@ TEST_F(GnssPoserNodeIntegration, Tf_StaticAntennaToBaseTransform_IsComposedAndBr
   EXPECT_EQ(peer_->broadcast_tfs.size(), 1U);
 }
 
-// The antenna frame is the fix's `header.frame_id`. A frame with no transform to base_frame, or a
-// frame equal to base_frame, yields the antenna pose unchanged (identity fallback); a known frame
-// gets the transform applied.
-//
-// NOTE(characterization): the unknown-frame case is a configuration error (the driver's frame_id
-// does not match any TF frame) that never resolves by waiting, yet the node keeps publishing the
-// antenna position as base_link, with the receiver's covariance and only a throttled warning. The
-// node does not distinguish this from a transform that is merely not available yet. The
-// frame_id == base_frame shortcut, by contrast, is a legitimate configuration.
-TEST_F(GnssPoserNodeIntegration, Tf_AntennaFrameComesFromFixHeader_UnknownFrameFallsBackToIdentity)
+// The antenna frame is the fix's `header.frame_id`. A fix in a frame with no transform to
+// base_frame publishes `gnss_fixed` only and is held; once a fix newer by more than
+// `antenna_transform_timeout_sec` arrives, the held fix is dropped without a pose. A frame equal to
+// base_frame needs no TF, and a known frame gets the transform applied.
+TEST_F(GnssPoserNodeIntegration, Tf_AntennaFrameComesFromFixHeader_UnknownFrameIsHeldThenDropped)
 {
   NodeParams params;
   params.gnss_pose_pub_method = 0;
   params.use_gnss_ins_orientation = true;
   params.base_frame = "my_base";
+  params.antenna_transform_timeout_sec = 0.5;
   ASSERT_NO_FATAL_FAILURE(build_node(params));
   const auto projector = make_mgrs_projector_info();
   send_projector_info(projector);
@@ -873,23 +884,29 @@ TEST_F(GnssPoserNodeIntegration, Tf_AntennaFrameComesFromFixHeader_UnknownFrameF
   ASSERT_NO_FATAL_FAILURE(broadcast_static_tf(
     "my_antenna", "my_base", make_point(1.0, 2.0, 0.5), yaw_to_quaternion(0.0)));
 
-  // Frame from the header is what gets looked up; a frame without TF yields the antenna pose.
-  const auto fix_unknown = make_reference_fix(NavSatStatus::STATUS_FIX, "some_other_antenna");
+  // Unknown frame: gnss_fixed is published, the pose is held.
+  auto fix_unknown = make_reference_fix(NavSatStatus::STATUS_FIX, "some_other_antenna");
+  fix_unknown.header.stamp = make_stamp(1000, 0);
   send_fix(fix_unknown);
-  ASSERT_NO_FATAL_FAILURE(wait_for_outputs(1));
-  expect_point_near(last_pose().pose.position, project_antenna(fix_unknown, projector));
-  EXPECT_NEAR(yaw_of(last_pose().pose.orientation), M_PI / 2.0, angle_tolerance);
+  ASSERT_NO_FATAL_FAILURE(wait_for_gnss_fixed(1));
+  expect_output_counts(1, 0, 0, 0);
+  EXPECT_TRUE(last_fixed().data);
 
-  // Same frame as base_frame: no lookup, identity.
-  const auto fix_base = make_reference_fix(NavSatStatus::STATUS_FIX, "my_base");
+  // A fix 1 s later in base_frame itself: the held fix expires (no pose for it) and this one is
+  // published without a lookup.
+  auto fix_base = make_reference_fix(NavSatStatus::STATUS_FIX, "my_base");
+  fix_base.header.stamp = make_stamp(1001, 0);
   send_fix(fix_base);
-  ASSERT_NO_FATAL_FAILURE(wait_for_outputs(2));
+  ASSERT_NO_FATAL_FAILURE(wait_for_outputs(1));
+  expect_output_counts(2, 1, 1, 1);
+  EXPECT_EQ(last_pose().header.stamp, fix_base.header.stamp);
   expect_point_near(last_pose().pose.position, project_antenna(fix_base, projector));
 
   // Known frame: the TF is applied (positive control).
-  const auto fix_known = make_reference_fix(NavSatStatus::STATUS_FIX, "my_antenna");
+  auto fix_known = make_reference_fix(NavSatStatus::STATUS_FIX, "my_antenna");
+  fix_known.header.stamp = make_stamp(1001, 0);
   send_fix(fix_known);
-  ASSERT_NO_FATAL_FAILURE(wait_for_outputs(3));
+  ASSERT_NO_FATAL_FAILURE(wait_for_outputs(2));
   const auto antenna = project_antenna(fix_known, projector);
   expect_point_near(
     last_pose().pose.position, make_point(antenna.x - 2.0, antenna.y + 1.0, antenna.z + 0.5));
@@ -901,10 +918,12 @@ TEST_F(GnssPoserNodeIntegration, Tf_AntennaFrameComesFromFixHeader_UnknownFrameF
 // falls back to identity, and a fix with a zero stamp means "latest" to tf2 and gets it applied
 // again.
 //
+// The antenna transform is looked up at the fix header stamp: a fix stamped after the latest TF
+// sample is held until a sample covering its stamp arrives, and is then composed with the value at
+// that stamp, not with the latest one at arrival time.
+//
 // The antenna sits rigidly on the vehicle and is normally published on /tf_static, where time is
-// ignored; a time-stamped transform is the only way to observe which time the node asks for. What
-// this pins is the lookup policy, which decides how the node reacts when the receiver's clock and
-// the TF clock disagree.
+// ignored; a time-stamped transform is the only way to observe which time the node asks for.
 TEST_F(GnssPoserNodeIntegration, Tf_LookupIsAtFixHeaderStamp)
 {
   NodeParams params;
@@ -917,6 +936,7 @@ TEST_F(GnssPoserNodeIntegration, Tf_LookupIsAtFixHeaderStamp)
   send_orientation(make_orientation(0.0));
 
   const auto t0 = make_stamp(1000, 0);
+  const auto t1 = make_stamp(1000, 400000000U);  // within antenna_transform_timeout_sec of t0
   ASSERT_NO_FATAL_FAILURE(broadcast_timed_tf(
     "my_antenna", "my_base", make_point(1.0, 0.0, 0.0), yaw_to_quaternion(0.0), t0));
 
@@ -930,21 +950,22 @@ TEST_F(GnssPoserNodeIntegration, Tf_LookupIsAtFixHeaderStamp)
   expect_point_near(
     last_pose().pose.position, make_point(projected.x + 1.0, projected.y, projected.z));
 
-  // Fix stamped 1 s later: lookup needs extrapolation, fails, and falls back to identity.
-  auto fix_later = fix_at_t0;
-  fix_later.header.stamp = make_stamp(1001, 0);
-  send_fix(fix_later);
-  ASSERT_NO_FATAL_FAILURE(wait_for_outputs(2));
-  expect_point_near(last_pose().pose.position, projected);
-  EXPECT_EQ(last_pose().header.stamp, fix_later.header.stamp);
+  // Fix stamped at t1, after the latest TF sample: the lookup would extrapolate, so the fix is
+  // held; only gnss_fixed comes out.
+  auto fix_at_t1 = fix_at_t0;
+  fix_at_t1.header.stamp = t1;
+  send_fix(fix_at_t1);
+  ASSERT_NO_FATAL_FAILURE(wait_for_gnss_fixed(2));
+  pump(delivery_budget);
+  expect_output_counts(2, 1, 1, 1);
 
-  // Fix with a zero stamp: tf2 treats time 0 as "latest", so the transform is applied again.
-  auto fix_zero = fix_at_t0;
-  fix_zero.header.stamp = make_stamp(0, 0);
-  send_fix(fix_zero);
-  ASSERT_NO_FATAL_FAILURE(wait_for_outputs(3));
+  // A TF sample at t1 makes the lookup at t1 possible: the held fix is published with that sample.
+  ASSERT_NO_FATAL_FAILURE(broadcast_timed_tf(
+    "my_antenna", "my_base", make_point(2.0, 0.0, 0.0), yaw_to_quaternion(0.0), t1));
+  ASSERT_NO_FATAL_FAILURE(wait_for_outputs(2));
+  EXPECT_EQ(last_pose().header.stamp, t1);
   expect_point_near(
-    last_pose().pose.position, make_point(projected.x + 1.0, projected.y, projected.z));
+    last_pose().pose.position, make_point(projected.x + 2.0, projected.y, projected.z));
 }
 
 int main(int argc, char ** argv)

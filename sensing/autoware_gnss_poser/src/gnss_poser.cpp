@@ -39,6 +39,11 @@ GnssPoser::GnssPoser(const GnssPoserParams & params, TransformLookup lookup_ante
     throw std::invalid_argument(
       "buff_epoch must be at least 1, got " + std::to_string(params.buff_epoch));
   }
+  if (params.antenna_transform_timeout_sec < 0.0) {
+    throw std::invalid_argument(
+      "antenna_transform_timeout_sec must not be negative, got " +
+      std::to_string(params.antenna_transform_timeout_sec));
+  }
   position_buffer_.set_capacity(params.buff_epoch);
 
   // Stand-in until the first INS message arrives (not to publish zero value covariances).
@@ -60,31 +65,148 @@ void GnssPoser::set_ins_orientation(
   ins_orientation_received_ = true;
 }
 
+namespace
+{
+double seconds_between(
+  const builtin_interfaces::msg::Time & older, const builtin_interfaces::msg::Time & newer)
+{
+  return (static_cast<double>(newer.sec) - static_cast<double>(older.sec)) +
+         (static_cast<double>(newer.nanosec) - static_cast<double>(older.nanosec)) * 1e-9;
+}
+}  // namespace
+
 GnssPoser::Result GnssPoser::input_fix(const sensor_msgs::msg::NavSatFix & fix)
 {
+  if (!newest_fix_stamp_ || seconds_between(*newest_fix_stamp_, fix.header.stamp) > 0.0) {
+    newest_fix_stamp_ = fix.header.stamp;
+  }
+
+  const auto gated = gate_check(fix);
+  if (gated) {
+    return record_evaluation({fix.header.stamp, *gated, std::nullopt});
+  }
+
+  // Older fixes are still waiting for their transform: queue behind them to keep the order.
+  if (!pending_fixes_.empty()) {
+    pending_fixes_.push_back(fix);
+    return {fix.header.stamp, Outcome::Pending, std::nullopt};
+  }
+
   const Result result = process_fix(fix);
+  if (result.outcome == Outcome::Pending) {
+    pending_fixes_.push_back(fix);
+    return result;
+  }
+
+  return record_evaluation(result);
+}
+
+bool GnssPoser::is_expired(const sensor_msgs::msg::NavSatFix & fix) const
+{
+  return newest_fix_stamp_ && seconds_between(fix.header.stamp, *newest_fix_stamp_) >
+                                params_.antenna_transform_timeout_sec;
+}
+
+std::optional<GnssPoser::Result> GnssPoser::next_ready()
+{
+  if (pending_fixes_.empty()) {
+    return std::nullopt;
+  }
+  const sensor_msgs::msg::NavSatFix & fix = pending_fixes_.front();
+
+  if (is_expired(fix)) {
+    const builtin_interfaces::msg::Time stamp = fix.header.stamp;
+    pending_fixes_.pop_front();
+    // The fix was never evaluated, so it does not become the latest outcome; that it was dropped
+    // for lack of a transform is reported on its own.
+    fixes_dropped_for_missing_transform_ = true;
+    return Result{stamp, Outcome::Expired, std::nullopt};
+  }
+
+  // Note that we need gate check even for a bufferred fix, because the projector info may have
+  // changed while the fix was waiting.
+  const auto gated = gate_check(fix);
+  if (gated) {
+    const Result result{fix.header.stamp, *gated, std::nullopt};
+    pending_fixes_.pop_front();
+    return record_evaluation(result);
+  }
+
+  const Result result = process_fix(fix);
+  if (result.outcome == Outcome::Pending) {
+    return std::nullopt;
+  }
+
+  pending_fixes_.pop_front();
+  return record_evaluation(result);
+}
+
+GnssPoser::Result GnssPoser::record_evaluation(const Result & result)
+{
   latest_outcome_ = result.outcome;
+  switch (result.outcome) {
+    case Outcome::NotFixed:
+      latest_fix_is_fixed_ = false;
+      break;
+
+    case Outcome::Buffering:
+    case Outcome::Published:
+      // The fix passed the fixed check and its transform was available.
+      latest_fix_is_fixed_ = true;
+      fixes_dropped_for_missing_transform_ = false;
+      break;
+
+    case Outcome::NoProjectorInfo:
+    case Outcome::LocalProjector:
+      // Rejected before the fixed check: the receiver status was not examined.
+      break;
+
+    case Outcome::Pending:
+    case Outcome::Expired:
+      break;
+  }
   return result;
 }
 
-GnssPoser::Result GnssPoser::process_fix(const sensor_msgs::msg::NavSatFix & fix)
+std::optional<GnssPoser::Outcome> GnssPoser::gate_check(
+  const sensor_msgs::msg::NavSatFix & fix) const
 {
   // Return immediately if map_projector_info has not been received yet.
   if (!received_map_projector_info_) {
-    return {Outcome::NoProjectorInfo, std::nullopt};
+    return Outcome::NoProjectorInfo;
   }
 
   if (projector_info_.projector_type == autoware_map_msgs::msg::MapProjectorInfo::LOCAL) {
-    return {Outcome::LocalProjector, std::nullopt};
+    return Outcome::LocalProjector;
   }
 
   // check fixed topic
   if (!is_fixed(fix.status)) {
-    return {Outcome::NotFixed, std::nullopt};
+    return Outcome::NotFixed;
   }
 
+  return std::nullopt;
+}
+
+GnssPoser::Result GnssPoser::process_fix(const sensor_msgs::msg::NavSatFix & fix)
+{
+  // get TF from gnss_antenna to base_link. If it cannot be obtained, pending the calculation.
+  const auto antenna_to_base_link =
+    lookup_antenna_to_base_link_(fix.header.frame_id, fix.header.stamp);
+  if (!antenna_to_base_link) {
+    // still waiting; the fixes behind it wait too
+    return {fix.header.stamp, Outcome::Pending, std::nullopt};
+  }
+
+  return compute_pose(fix, *antenna_to_base_link);
+}
+
+GnssPoser::Result GnssPoser::compute_pose(
+  const sensor_msgs::msg::NavSatFix & fix,
+  const geometry_msgs::msg::Transform & antenna_to_base_link)
+{
   // get position
-  const geometry_msgs::msg::Point position = project_to_map(fix, projector_info_);
+  const auto position = project_to_map(fix, projector_info_);
 
   geometry_msgs::msg::Pose gnss_antenna_pose{};
 
@@ -95,7 +217,7 @@ GnssPoser::Result GnssPoser::process_fix(const sensor_msgs::msg::NavSatFix & fix
     // fill position buffer
     position_buffer_.push_front(position);
     if (!position_buffer_.full()) {
-      return {Outcome::Buffering, std::nullopt};
+      return {fix.header.stamp, Outcome::Buffering, std::nullopt};
     }
     // publish average pose or median pose of position buffer
     gnss_antenna_pose.position = (params_.gnss_pose_pub_method == GnssPosePubMethod::Average)
@@ -118,13 +240,6 @@ GnssPoser::Result GnssPoser::process_fix(const sensor_msgs::msg::NavSatFix & fix
 
   gnss_antenna_pose.orientation = orientation;
 
-  // get TF from gnss_antenna to base_link. If it cannot be obtained, the antenna pose is published
-  // as the base_link pose, i.e. the identity transform is used (a default-constructed Transform has
-  // zero translation and rotation w = 1).
-  const geometry_msgs::msg::Transform antenna_to_base_link =
-    lookup_antenna_to_base_link_(fix.header.frame_id, fix.header.stamp)
-      .value_or(geometry_msgs::msg::Transform{});
-
   std::array<double, 3> rotation_variances{};
   if (params_.use_gnss_ins_orientation) {
     rotation_variances[0] = std::pow(ins_orientation_.rmse_rotation_x, 2);
@@ -140,7 +255,7 @@ GnssPoser::Result GnssPoser::process_fix(const sensor_msgs::msg::NavSatFix & fix
   gnss_base_pose_with_covariance.pose =
     compose_base_link_pose(gnss_antenna_pose, antenna_to_base_link);
   gnss_base_pose_with_covariance.covariance = make_pose_covariance(fix, rotation_variances);
-  return {Outcome::Published, gnss_base_pose_with_covariance};
+  return {fix.header.stamp, Outcome::Published, gnss_base_pose_with_covariance};
 }
 
 GnssPoser::Status GnssPoser::take_status() const
@@ -153,6 +268,9 @@ GnssPoser::Status GnssPoser::take_status() const
     projector_info_.projector_type == autoware_map_msgs::msg::MapProjectorInfo::LOCAL;
   status.ins_orientation_received = ins_orientation_received_;
   status.position_buffer_size = position_buffer_.size();
+  status.pending_fix_count = pending_fixes_.size();
+  status.latest_fix_is_fixed = latest_fix_is_fixed_;
+  status.fixes_dropped_for_missing_transform = fixes_dropped_for_missing_transform_;
   status.latest_outcome = latest_outcome_;
   return status;
 }
@@ -166,6 +284,10 @@ const char * to_string(const GnssPoser::Outcome outcome)
       return "LocalProjector";
     case GnssPoser::Outcome::NotFixed:
       return "NotFixed";
+    case GnssPoser::Outcome::Pending:
+      return "Pending";
+    case GnssPoser::Outcome::Expired:
+      return "Expired";
     case GnssPoser::Outcome::Buffering:
       return "Buffering";
     case GnssPoser::Outcome::Published:
