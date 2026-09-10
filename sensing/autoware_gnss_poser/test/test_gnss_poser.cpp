@@ -1319,3 +1319,59 @@ TEST(GnssPoser, Tf_LookedUpTransform_IsComposedWithAntennaPose)
     pose_of(result).position, make_point(antenna.x - 2.0, antenna.y + 1.0, antenna.z + 0.5));
   EXPECT_NEAR(std::abs(yaw_of(pose_of(result).orientation)), M_PI, angle_tolerance);
 }
+
+// =======================================================================================
+// 7. Status for diagnostics
+// =======================================================================================
+
+// take_status() reports the configured orientation source, what has arrived, whether the projector
+// is usable, the buffer fill and the latest outcome.
+TEST(GnssPoser, Status_BeforeAnyInput_ReportsNothingReceived)
+{
+  // Arrange
+  const GnssPoser poser(make_buffer_params(1, 2), identity_lookup);
+
+  // Act
+  const auto status = poser.take_status();
+
+  // Assert
+  EXPECT_TRUE(status.use_gnss_ins_orientation);
+  EXPECT_FALSE(status.projector_info_received);
+  EXPECT_FALSE(status.projector_is_local);
+  EXPECT_FALSE(status.ins_orientation_received);
+  EXPECT_EQ(status.position_buffer_size, 0U);
+  EXPECT_FALSE(status.latest_outcome.has_value());
+}
+
+TEST(GnssPoser, Status_LocalProjector_ReportsLocalProjectorAndLatestOutcome)
+{
+  // Arrange
+  GnssPoser poser(make_buffer_params(1, 2), identity_lookup);
+  poser.set_projector_info(make_local_projector_info());
+  poser.input_fix(make_reference_fix());
+
+  // Act
+  const auto status = poser.take_status();
+
+  // Assert
+  EXPECT_TRUE(status.projector_info_received);
+  EXPECT_TRUE(status.projector_is_local);
+  EXPECT_EQ(status.latest_outcome, GnssPoser::Outcome::LocalProjector);
+}
+
+TEST(GnssPoser, Status_Buffering_ReportsInsOrientationAndBufferFill)
+{
+  // Arrange
+  GnssPoser poser = make_poser_with_mgrs_projector(make_buffer_params(1, 2));
+  poser.set_ins_orientation(GnssInsOrientation{});
+  poser.input_fix(make_reference_fix());
+
+  // Act
+  const auto status = poser.take_status();
+
+  // Assert
+  EXPECT_FALSE(status.projector_is_local);
+  EXPECT_TRUE(status.ins_orientation_received);
+  EXPECT_EQ(status.position_buffer_size, 1U);
+  EXPECT_EQ(status.latest_outcome, GnssPoser::Outcome::Buffering);
+}

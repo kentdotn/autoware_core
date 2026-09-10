@@ -47,6 +47,8 @@
 #include <autoware_internal_debug_msgs/msg/bool_stamped.hpp>
 #include <autoware_map_msgs/msg/map_projector_info.hpp>
 #include <autoware_sensing_msgs/msg/gnss_ins_orientation_stamped.hpp>
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <geographic_msgs/msg/geo_point.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
@@ -75,6 +77,8 @@ namespace
 using autoware_internal_debug_msgs::msg::BoolStamped;
 using autoware_map_msgs::msg::MapProjectorInfo;
 using autoware_sensing_msgs::msg::GnssInsOrientationStamped;
+using diagnostic_msgs::msg::DiagnosticArray;
+using diagnostic_msgs::msg::DiagnosticStatus;
 using geometry_msgs::msg::Point;
 using geometry_msgs::msg::PoseStamped;
 using geometry_msgs::msg::PoseWithCovarianceStamped;
@@ -379,6 +383,14 @@ public:
     fixed_sub_ = create_subscription<BoolStamped>(
       "gnss_fixed", rclcpp::QoS{100},
       [this](const BoolStamped::ConstSharedPtr msg) { fixed_flags.push_back(*msg); });
+    diagnostics_sub_ = create_subscription<DiagnosticArray>(
+      "/diagnostics", rclcpp::QoS{100}, [this](const DiagnosticArray::ConstSharedPtr msg) {
+        for (const auto & status : msg->status) {
+          if (status.hardware_id == "gnss_poser") {
+            diagnostics.push_back(status);
+          }
+        }
+      });
     tf_sub_ = create_subscription<TFMessage>(
       "/tf", rclcpp::QoS{100}, [this](const TFMessage::ConstSharedPtr msg) {
         for (const auto & t : msg->transforms) {
@@ -411,6 +423,7 @@ public:
   rclcpp::Subscription<PoseWithCovarianceStamped>::SharedPtr pose_cov_sub_;
   rclcpp::Subscription<BoolStamped>::SharedPtr fixed_sub_;
   rclcpp::Subscription<TFMessage>::SharedPtr tf_sub_;
+  rclcpp::Subscription<DiagnosticArray>::SharedPtr diagnostics_sub_;
   std::shared_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
   std::shared_ptr<tf2_ros::TransformBroadcaster> dynamic_tf_broadcaster_;
   // Observer buffer: used only to know that a TF we broadcast has propagated. It is filled by the
@@ -424,6 +437,7 @@ public:
   std::vector<PoseWithCovarianceStamped> pose_cov_msgs;
   std::vector<BoolStamped> fixed_flags;
   std::vector<TransformStamped> broadcast_tfs;
+  std::vector<DiagnosticStatus> diagnostics;
 };
 
 // Drives the node over its real topics from the test thread. There is no background spin on the
@@ -597,7 +611,8 @@ protected:
            has("/gnss_pose", "geometry_msgs/msg/PoseStamped") &&
            has("/gnss_pose_cov", "geometry_msgs/msg/PoseWithCovarianceStamped") &&
            has("/gnss_fixed", "autoware_internal_debug_msgs/msg/BoolStamped") &&
-           has("/tf", "tf2_msgs/msg/TFMessage");
+           has("/tf", "tf2_msgs/msg/TFMessage") &&
+           has("/diagnostics", "diagnostic_msgs/msg/DiagnosticArray");
   }
 
   // build_node() followed by the MGRS projector info.
@@ -654,6 +669,17 @@ protected:
   std::shared_ptr<autoware::gnss_poser::GnssPoserNode> node_;
   std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> executor_;
 };
+
+// The value of `key` in a diagnostics status, or "<missing>".
+std::string value_of(const DiagnosticStatus & status, const std::string & key)
+{
+  for (const auto & kv : status.values) {
+    if (kv.key == key) {
+      return kv.value;
+    }
+  }
+  return std::string("<missing>");
+}
 
 // The endpoint gnss_poser owns among `infos`; throws when there is none.
 rclcpp::TopicEndpointInfo gnss_poser_endpoint(const std::vector<rclcpp::TopicEndpointInfo> & infos)
@@ -1082,6 +1108,69 @@ TEST_F(GnssPoserNodeIntegration, Tf_LookupIsAtFixHeaderStamp_LaterFixFallsBackTo
   ASSERT_NO_FATAL_FAILURE(wait_for_outputs(1));
   expect_point_near(last_pose().pose.position, projected);
   EXPECT_EQ(last_pose().header.stamp, make_stamp(1001, 0));
+}
+
+// =======================================================================================
+// 5. Diagnostics
+// =======================================================================================
+
+// The diagnostics status `gnss_poser: gnss_poser_status` carries the facts the node gathers and
+// the level decided from them. Which conditions map to which level is unit-tested in
+// test_gnss_poser_diagnostics.cpp; these cases check the wiring to /diagnostics: every key once a
+// fix has been published, and a level other than OK when TF cannot provide the antenna transform.
+TEST_F(GnssPoserNodeIntegration, Diagnostics_AfterPublishedFix_ReportsOkWithEveryKey)
+{
+  // Arrange
+  // A buffer of two, so that position_buffer_size differs from its initial 0.
+  ASSERT_NO_FATAL_FAILURE(build_node(make_buffer_params(1, 2)));
+  send_projector_info(make_mgrs_projector_info());
+  send_orientation(make_orientation(0.0));
+  // The fixes are stamped in base_link itself, so the antenna transform is available without TF.
+  send_fix(make_reference_fix(NavSatStatus::STATUS_FIX, "base_link"));
+  send_fix(make_reference_fix(NavSatStatus::STATUS_FIX, "base_link"));
+  ASSERT_NO_FATAL_FAILURE(wait_for_outputs(1));
+  peer_->diagnostics.clear();
+
+  // Act
+  const bool received = pump_until([this] { return !peer_->diagnostics.empty(); }, wait_budget);
+
+  // Assert
+  ASSERT_TRUE(received);
+  const auto & after = peer_->diagnostics.back();
+  EXPECT_EQ(after.name, "gnss_poser: gnss_poser_status");
+  EXPECT_EQ(after.level, DiagnosticStatus::OK);
+  EXPECT_EQ(value_of(after, "is_arrived_first_fix"), "True");
+  // The value is written by std::to_string, which keeps six decimals.
+  constexpr double stamp_tolerance = 1e-6;  // [s]
+  EXPECT_NEAR(
+    std::stod(value_of(after, "latest_fix_time_stamp")), rclcpp::Time(fix_stamp()).seconds(),
+    stamp_tolerance);
+  EXPECT_EQ(value_of(after, "is_arrived_first_map_projector_info"), "True");
+  EXPECT_EQ(value_of(after, "is_arrived_first_orientation"), "True");
+  EXPECT_EQ(value_of(after, "latest_outcome"), "Published");
+  EXPECT_EQ(value_of(after, "position_buffer_size"), "2");
+  EXPECT_EQ(value_of(after, "is_antenna_transform_available"), "True");
+}
+
+TEST_F(GnssPoserNodeIntegration, Diagnostics_UnknownAntennaFrame_ReportsError)
+{
+  // Arrange
+  ASSERT_NO_FATAL_FAILURE(build_node({}));
+  send_projector_info(make_mgrs_projector_info());
+  send_orientation(make_orientation(0.0));
+  // No TF is published for this frame, so the lookup fails.
+  send_fix(make_reference_fix(NavSatStatus::STATUS_FIX, "some_other_antenna"));
+  ASSERT_NO_FATAL_FAILURE(wait_for_outputs(1));
+  peer_->diagnostics.clear();
+
+  // Act
+  const bool received = pump_until([this] { return !peer_->diagnostics.empty(); }, wait_budget);
+
+  // Assert
+  ASSERT_TRUE(received);
+  const auto & after = peer_->diagnostics.back();
+  EXPECT_EQ(after.level, DiagnosticStatus::ERROR);
+  EXPECT_EQ(value_of(after, "is_antenna_transform_available"), "False");
 }
 
 int main(int argc, char ** argv)
