@@ -29,6 +29,7 @@
 #include <boost/circular_buffer.hpp>
 
 #include <array>
+#include <deque>
 #include <functional>
 #include <optional>
 #include <string>
@@ -50,40 +51,51 @@ struct GnssPoserParams
   GnssPosePubMethod gnss_pose_pub_method = GnssPosePubMethod::Instant;
   int buff_epoch = 1;
   bool use_gnss_ins_orientation = true;
+  // How long a fix may wait for its antenna transform, measured between fix header stamps: a
+  // pending fix is dropped once a fix newer by more than this has arrived.
+  double antenna_transform_timeout_sec = 0.5;
 };
 
 /// \brief Turns GNSS fixes into base_link poses in the map frame.
 ///
 /// Feed the map projector info and, when configured, the INS orientation through the setters, then
-/// call input_fix() for every NavSatFix. The result says whether the fix produced a pose or why it
-/// did not; what to publish and log for each outcome is the caller's decision.
+/// call input_fix() for every NavSatFix and drain next_ready() after every input. A fix whose
+/// antenna transform is not available yet is held (Outcome::Pending) and comes out of next_ready()
+/// once the transform can be looked up, or as Outcome::Expired once a fix newer by more than
+/// antenna_transform_timeout_sec has arrived. Held fixes are processed in arrival order; a fix that
+/// arrives while others are held is held too, so the position buffer and the motion heading see
+/// the fixes in order. What to publish and log for each outcome is the caller's decision.
 class GnssPoser
 {
 public:
   /// \brief Resolves the transform from the antenna frame named in the fix header to base_link at
-  /// the fix header stamp, or std::nullopt when it cannot be resolved.
+  /// the fix header stamp, or std::nullopt when it cannot be resolved (yet).
   ///
-  /// input_fix() calls it only for a fix that passed the gates and the buffering, right before the
-  /// pose is composed. Obtaining the transform (TF lookup, logging) is the caller's business; what
-  /// to do when there is none is decided here.
+  /// Called for every fix that passed the gates, at input and again from next_ready() while the fix
+  /// is held. Obtaining the transform (TF lookup, logging) is the caller's business; what to do
+  /// when there is none is decided here.
   using TransformLookup = std::function<std::optional<geometry_msgs::msg::Transform>(
     const std::string & antenna_frame, const builtin_interfaces::msg::Time & stamp)>;
 
   /// \param lookup_antenna_to_base_link see TransformLookup; kept for the lifetime of the object.
-  /// \throw std::invalid_argument when params.buff_epoch is smaller than 1.
+  /// \throw std::invalid_argument when params.buff_epoch is smaller than 1 or
+  /// params.antenna_transform_timeout_sec is negative.
   GnssPoser(const GnssPoserParams & params, TransformLookup lookup_antenna_to_base_link);
 
-  /// \brief What input_fix() did with the fix.
+  /// \brief What became of a fix.
   enum class Outcome {
     NoProjectorInfo,  ///< no map projector info received yet; nothing was derived from the fix
     LocalProjector,   ///< the map uses a local projector, so a GNSS fix cannot be converted
     NotFixed,         ///< the receiver reports no fix; its status is known but no pose is computed
+    Pending,          ///< held until its antenna transform is available, see next_ready()
+    Expired,          ///< dropped: its antenna transform did not become available in time
     Buffering,        ///< the position buffer is not full yet (average and median methods)
     Published,        ///< a pose was computed, see Result::pose_with_covariance
   };
 
   struct Result
   {
+    builtin_interfaces::msg::Time stamp;  ///< header stamp of the fix this result is about
     Outcome outcome;
     /// The base_link pose in the map frame with its 6x6 covariance (only the diagonal is filled).
     /// Set exactly when outcome is Outcome::Published.
@@ -96,9 +108,16 @@ public:
   /// call, an identity orientation with an rmse of 1.0 rad per axis stands in for it.
   void set_ins_orientation(const autoware_sensing_msgs::msg::GnssInsOrientation & orientation);
 
-  /// \brief Process one fix: gate, project, buffer, orient, compose with the antenna transform and
-  /// attach the covariance.
+  /// \brief Take one fix: a gated fix is answered at once; otherwise it is held if its transform is
+  /// not available yet or if older fixes are still held, and processed (project, buffer, orient,
+  /// compose with the antenna transform, attach the covariance) if not.
   Result input_fix(const sensor_msgs::msg::NavSatFix & fix);
+
+  /// \brief Process the oldest held fix if it can be processed now.
+  /// \return its result (Buffering, Published, Expired, or a gate outcome if the projector info
+  /// changed meanwhile), or std::nullopt when nothing is held or the oldest held fix is still
+  /// waiting for its transform. Call repeatedly after every input until it returns std::nullopt.
+  std::optional<Result> next_ready();
 
   /// \brief Snapshot of the state the caller reports as diagnostics.
   struct Status
@@ -108,12 +127,28 @@ public:
     bool projector_is_local = false;
     bool ins_orientation_received = false;  ///< false while the rmse 1.0 stand-in is in use
     std::size_t position_buffer_size = 0;
-    std::optional<Outcome> latest_outcome;  ///< of the most recent input_fix(), if any
+    std::size_t pending_fix_count = 0;  ///< fixes waiting for their antenna transform
+    /// Outcome of the last fix that was evaluated. A fix that was only held or dropped for lack of
+    /// its antenna transform was never evaluated, so Pending and Expired never appear here.
+    std::optional<Outcome> latest_outcome;
+    /// Receiver status of the last fix that reached the fixed check, i.e. that was not rejected by
+    /// the projector gates first. Empty while no fix has got that far.
+    std::optional<bool> latest_fix_is_fixed;
+    /// A held fix was dropped for lack of its antenna transform and none has been processed since.
+    bool fixes_dropped_for_missing_transform = false;
   };
   Status take_status() const;
 
 private:
+  std::optional<Outcome> gate_check(const sensor_msgs::msg::NavSatFix & fix) const;
   Result process_fix(const sensor_msgs::msg::NavSatFix & fix);
+  Result compute_pose(
+    const sensor_msgs::msg::NavSatFix & fix,
+    const geometry_msgs::msg::Transform & antenna_to_base_link);
+  bool is_expired(const sensor_msgs::msg::NavSatFix & fix) const;
+  // Remember what the evaluation of a fix said, for take_status(). Only a fix that was evaluated
+  // passes here: a held fix (Pending) has not been evaluated yet, and an expired one never was.
+  Result record_evaluation(const Result & result);
 
   GnssPoserParams params_;
   TransformLookup lookup_antenna_to_base_link_;
@@ -121,6 +156,11 @@ private:
   bool received_map_projector_info_ = false;
   bool ins_orientation_received_ = false;
   std::optional<Outcome> latest_outcome_;
+  std::optional<bool> latest_fix_is_fixed_;
+  bool fixes_dropped_for_missing_transform_ = false;
+  std::deque<sensor_msgs::msg::NavSatFix> pending_fixes_;
+  // Newest fix header stamp seen so far; the reference for antenna_transform_timeout_sec.
+  std::optional<builtin_interfaces::msg::Time> newest_fix_stamp_;
   boost::circular_buffer<geometry_msgs::msg::Point> position_buffer_;
   // Previous antenna position used to derive orientation from motion.
   geometry_msgs::msg::Point prev_position_;

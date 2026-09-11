@@ -9,7 +9,7 @@ The `gnss_poser` is a node that subscribes gnss sensing messages and calculates 
 This node subscribes to NavSatFix to publish the pose of **base_link**. The data in NavSatFix represents the antenna's position. Therefore, it performs a coordinate transformation using the tf from `base_link` to the antenna's position. The frame_id of the antenna's position refers to NavSatFix's `header.frame_id`.
 (**Note that `header.frame_id` in NavSatFix indicates the antenna's frame_id, not the Earth or reference ellipsoid.** [See also NavSatFix definition.](https://docs.ros.org/en/noetic/api/sensor_msgs/html/msg/NavSatFix.html))
 
-If the transformation from `base_link` to the antenna cannot be obtained, it outputs the pose of the antenna position without performing coordinate transformation.
+The transform from the antenna frame to `base_frame` is expected to be static (a fixed joint in the sensor kit description, published on `/tf_static`); an antenna mounted directly at `base_link` still needs it, with a zero offset, or a `header.frame_id` equal to `base_frame`. A fix whose transform is not available yet is held and published once it is; if a fix newer by more than `antenna_transform_timeout_sec` arrives first, the held fix is dropped and the `/diagnostics` status turns to ERROR. `gnss_fixed` is published when the fix arrives, whether or not its pose is held.
 
 ## Inputs / Outputs
 
@@ -39,9 +39,11 @@ The node publishes one status, `gnss_poser: gnss_poser_status`, on `/diagnostics
 | `latest_fix_time_stamp`               | header stamp of the latest NavSatFix. [second]                                               | none                                    | none                          |
 | `is_arrived_first_map_projector_info` | whether `map_projector_info` has been received at least once.                                | not arrived yet                         | none                          |
 | `is_arrived_first_orientation`        | whether `autoware_orientation` has been received at least once.                              | not arrived yet while `use_gnss_ins_orientation` is true (the identity orientation is used) | none |
-| `latest_outcome`                      | what the latest NavSatFix produced: `NoProjectorInfo`, `LocalProjector`, `NotFixed`, `Buffering` or `Published`. | `NotFixed`               | `LocalProjector`              |
+| `latest_outcome`                      | what the last evaluated fix produced: `NoProjectorInfo`, `LocalProjector`, `NotFixed`, `Buffering` or `Published`. A fix that is only held, or dropped for lack of its transform, is not evaluated and does not change this. | `NotFixed` | `LocalProjector` |
 | `position_buffer_size`                | number of positions in the averaging / median buffer.                                        | none                                    | none                          |
-| `is_antenna_transform_available`      | whether the latest TF lookup from the antenna frame to `base_frame` succeeded.               | none                                    | failed (the antenna pose is published as the base_link pose) |
+| `pending_fix_count`                   | number of fixes held for their antenna transform.                                            | greater than 0                          | none                          |
+| `is_antenna_transform_available`      | whether the latest TF lookup from the antenna frame to `base_frame` succeeded.               | none                                    | none                          |
+| `is_dropping_fixes_for_missing_transform` | whether a held fix was dropped for lack of its antenna transform and none has been processed since. | none                     | dropped                       |
 
 ## Parameters
 
@@ -55,5 +57,6 @@ Parameters in below table
 | `use_gnss_ins_orientation` | `boolean` | `true`           | use Gnss-Ins orientation                                                                                                             |
 | `gnss_pose_pub_method`     | `integer` | `0`              | 0: Instant Value 1: Average Value 2: Median Value. Any other value is rejected at startup.                                           |
 | `buff_epoch`               | `integer` | `1`              | Number of positions the average / median is taken over (ignored for method 0). Range: 1~inf; smaller values are rejected at startup. |
+| `antenna_transform_timeout_sec` | `double` | `0.5`       | How long a fix may wait for the TF from its antenna frame to `base_frame`, measured between fix header stamps. Negative values are rejected at startup. |
 
 All above parameters can be changed in config file [gnss_poser.param.yaml](./config/gnss_poser.param.yaml "Click here to open config file") .

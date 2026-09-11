@@ -16,7 +16,9 @@
 
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
 
+#include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -28,10 +30,13 @@ struct DiagnosticsState
   bool fix_arrived = false;
   bool projector_info_received = false;
   bool projector_is_local = false;
-  bool latest_fix_is_fixed = true;  ///< false when the most recent fix had no position solution
+  /// Receiver status of the last fix that reached the fixed check; empty when no fix has.
+  std::optional<bool> latest_fix_is_fixed;
   bool use_gnss_ins_orientation = true;
   bool ins_orientation_received = false;
-  bool antenna_transform_available = true;  ///< false when the last TF lookup failed
+  std::size_t pending_fix_count = 0;  ///< fixes held for their antenna transform
+  /// A held fix was dropped for lack of its antenna transform and none has been processed since.
+  bool fixes_dropped_for_missing_transform = false;
   std::string antenna_frame;
   std::string base_frame;
 };
@@ -53,10 +58,10 @@ struct DiagnosticsResult
 
 /// \brief Evaluate the diagnostics state. Pure function: no node, clock or interface dependency.
 ///
-/// Missing inputs (fix, map projector info, INS orientation) and a fix without a position solution
-/// are WARN: they are expected transients. A local projector and an antenna transform that TF
-/// cannot provide are ERROR: the first makes every fix unusable, the second makes the node publish
-/// the antenna pose as the base_link pose.
+/// Missing inputs (fix, map projector info, INS orientation), a fix without a position solution and
+/// fixes waiting for their antenna transform are WARN: they are expected transients. A local
+/// projector and fixes dropped because their antenna transform never became available are ERROR:
+/// the first makes every fix unusable, the second means the TF tree lacks the antenna frame.
 DiagnosticsResult determine_diagnostics(const DiagnosticsState & state);
 }  // namespace autoware::gnss_poser
 
