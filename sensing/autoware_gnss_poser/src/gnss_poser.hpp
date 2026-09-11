@@ -100,17 +100,36 @@ public:
   /// attach the covariance.
   Result input_fix(const sensor_msgs::msg::NavSatFix & fix);
 
+  /// \brief Snapshot of the state the caller reports as diagnostics.
+  struct Status
+  {
+    bool use_gnss_ins_orientation = true;  ///< from the parameters
+    bool projector_info_received = false;
+    bool projector_is_local = false;
+    bool ins_orientation_received = false;  ///< false while the rmse 1.0 stand-in is in use
+    std::size_t position_buffer_size = 0;
+    std::optional<Outcome> latest_outcome;  ///< of the most recent input_fix(), if any
+  };
+  Status take_status() const;
+
 private:
+  Result process_fix(const sensor_msgs::msg::NavSatFix & fix);
+
   GnssPoserParams params_;
   TransformLookup lookup_antenna_to_base_link_;
   autoware_map_msgs::msg::MapProjectorInfo projector_info_;
   bool received_map_projector_info_ = false;
+  bool ins_orientation_received_ = false;
+  std::optional<Outcome> latest_outcome_;
   boost::circular_buffer<geometry_msgs::msg::Point> position_buffer_;
   // Previous antenna position used to derive orientation from motion.
   geometry_msgs::msg::Point prev_position_;
   bool has_prev_position_ = false;
   autoware_sensing_msgs::msg::GnssInsOrientation ins_orientation_;
 };
+
+/// \brief Name of an outcome, for diagnostics and logs.
+const char * to_string(GnssPoser::Outcome outcome);
 
 // Stages of the pose computation.
 
