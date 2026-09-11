@@ -59,7 +59,7 @@ private:
   std::optional<geometry_msgs::msg::Transform> get_static_transform(
     const std::string & target_frame, const std::string & source_frame,
     const builtin_interfaces::msg::Time & stamp);
-  void publish_fixed(bool fixed);
+  void publish_fixed(const builtin_interfaces::msg::Time & stamp, bool fixed);
   void publish_pose(
     const builtin_interfaces::msg::Time & stamp,
     const geometry_msgs::msg::PoseWithCovariance & pose_with_covariance);
