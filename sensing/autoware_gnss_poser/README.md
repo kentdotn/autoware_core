@@ -9,7 +9,9 @@ The `gnss_poser` is a node that subscribes gnss sensing messages and calculates 
 This node subscribes to NavSatFix to publish the pose of **base_link**. The data in NavSatFix represents the antenna's position. Therefore, it performs a coordinate transformation using the tf from `base_link` to the antenna's position. The frame_id of the antenna's position refers to NavSatFix's `header.frame_id`.
 (**Note that `header.frame_id` in NavSatFix indicates the antenna's frame_id, not the Earth or reference ellipsoid.** [See also NavSatFix definition.](https://docs.ros.org/en/noetic/api/sensor_msgs/html/msg/NavSatFix.html))
 
-If the transformation from `base_link` to the antenna cannot be obtained, it outputs the pose of the antenna position without performing coordinate transformation.
+The antenna is rigidly mounted on the vehicle, so this transformation is expected to be static; an antenna that moves relative to `base_link` is out of scope. Publishing it on `/tf_static` is recommended, but a setup that publishes the same fixed relation on `/tf` is supported as well: the node looks up the latest transform rather than the transform at the fix's `header.stamp`, which `/tf` cannot always provide.
+
+If the transformation from `base_link` to the antenna cannot be obtained, the fix is skipped: `gnss_fixed` still reports the receiver's status, but no pose is published. This is expected right after startup, before the transformation has been received, so while TF does not know the antenna frame the fixes are skipped silently for up to 5 seconds. After that, or at once when TF knows the frame but cannot connect it to `base_link`, the node logs an error (throttled to once a second) naming both frames, so that a `header.frame_id` that never gets a transformation is visible instead of silently yielding no pose.
 
 ## Inputs / Outputs
 

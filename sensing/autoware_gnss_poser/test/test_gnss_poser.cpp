@@ -44,6 +44,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <optional>
 #include <stdexcept>
@@ -52,6 +53,8 @@
 
 namespace
 {
+using autoware::gnss_poser::AntennaTransformFailure;
+using autoware::gnss_poser::AntennaTransformFailureFilter;
 using autoware::gnss_poser::GnssPosePubMethod;
 using autoware::gnss_poser::GnssPoser;
 using autoware::gnss_poser::GnssPoserParams;
@@ -404,12 +407,11 @@ void expect_rotation_variances_near(
   EXPECT_NEAR(covariance[cov_yaw_yaw], yaw, rmse_squared_tolerance);
 }
 
-// The fixes of these cases carry the frame `gnss`, for which the node had no transform and
-// composed with the identity; the lookup that stands in for TF provides the identity directly.
-const GnssPoser::TransformLookup identity_lookup =
-  [](const std::string &, const builtin_interfaces::msg::Time &) {
-    return std::optional<Transform>(Transform{});
-  };
+// The lookup that stands in for TF provides the identity, so that the cases taken from the node
+// characterization stay about what they check rather than about the antenna transform.
+const GnssPoser::TransformLookup identity_lookup = [](const std::string &) {
+  return std::optional<Transform>(Transform{});
+};
 
 // A GnssPoser that has received the MGRS projector info.
 GnssPoser make_poser_with_mgrs_projector(const GnssPoserParams & params)
@@ -495,6 +497,25 @@ struct CovarianceType
 };
 
 class GnssPoserKnownCovarianceType : public ::testing::TestWithParam<CovarianceType>
+{
+};
+
+// One antenna transform lookup: its failure, or std::nullopt for a success, and when it happened.
+struct Lookup
+{
+  std::optional<AntennaTransformFailure> failure;
+  std::chrono::milliseconds at;
+};
+
+// Lookups in order, and whether the failure of the last one is reported.
+struct FailureReportCase
+{
+  const char * name;
+  std::vector<Lookup> lookups;
+  bool reported;
+};
+
+class AntennaTransformFailureReport : public ::testing::TestWithParam<FailureReportCase>
 {
 };
 }  // namespace
@@ -1157,3 +1178,98 @@ TEST(GnssPoser, Covariance_UnknownType_PositionVariancesAreTen)
     }
   }
 }
+
+// =======================================================================================
+// 6. Antenna transform
+// =======================================================================================
+
+// Without the antenna transform the fix cannot be expressed as a base_link pose, so it is dropped.
+// The receiver had a position solution, so its status is still reported.
+TEST(GnssPoser, Tf_MissingTransform_PublishesOnlyGnssFixed)
+{
+  // Arrange
+  GnssPoser poser({}, [](const std::string &) { return std::optional<Transform>(); });
+  poser.set_projector_info(make_mgrs_projector_info());
+
+  // Act
+  const auto result = poser.input_fix(make_reference_fix());
+
+  // Assert
+  EXPECT_EQ(result.outcome, GnssPoser::Outcome::NoAntennaTransform);
+  expect_only_gnss_fixed(result);
+  EXPECT_TRUE(result.gnss_fixed.value().data);
+}
+
+// A fix dropped for lack of the transform has still been observed: it stays in the position
+// buffer, so the average once the transform is available includes it.
+TEST(GnssPoser, Tf_MissingTransform_FixStaysInPositionBuffer)
+{
+  // Arrange
+  std::optional<Transform> available;  // no transform until it is assigned
+  GnssPoser poser(
+    make_buffer_params(1, 2), [&available](const std::string &) { return available; });
+  poser.set_projector_info(make_mgrs_projector_info());
+  const auto fixes = make_average_fixes();
+  input_fixes(poser, {fixes[0], fixes[1]});
+  available = Transform{};
+
+  // Act
+  const auto result = poser.input_fix(fixes[2]);
+
+  // Assert
+  expect_point_near(
+    pose_of(result).position, mean_of({project_mgrs(fixes[1]), project_mgrs(fixes[2])}));
+}
+
+// An unknown antenna frame is expected right after startup, so it is reported only once the lookups
+// have been failing for longer than the grace period; a success starts the next one afresh. A
+// frame that TF knows but cannot resolve does not get better by waiting and is reported at once.
+TEST_P(AntennaTransformFailureReport, Filter_FailedLookups_ReportsPersistentOrUnresolvable)
+{
+  // Arrange
+  constexpr std::chrono::seconds grace_period{5};
+  const AntennaTransformFailureFilter::Clock::time_point start{};
+  AntennaTransformFailureFilter filter(grace_period);
+  const std::vector<Lookup> & lookups = GetParam().lookups;
+  for (auto lookup = lookups.begin(); lookup != lookups.end() - 1; ++lookup) {
+    if (lookup->failure.has_value()) {
+      filter.record_failure(lookup->failure.value(), start + lookup->at);
+    } else {
+      filter.record_success();
+    }
+  }
+
+  // Act
+  const bool reported =
+    filter.record_failure(lookups.back().failure.value(), start + lookups.back().at);
+
+  // Assert
+  EXPECT_EQ(reported, GetParam().reported);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  FailedLookups, AntennaTransformFailureReport,
+  ::testing::Values(
+    FailureReportCase{
+      "UnknownFrameWithinGracePeriod",
+      {{AntennaTransformFailure::UnknownFrame, std::chrono::milliseconds(0)},
+       {AntennaTransformFailure::UnknownFrame, std::chrono::milliseconds(4900)}},
+      false},
+    FailureReportCase{
+      "UnknownFrameAfterGracePeriod",
+      {{AntennaTransformFailure::UnknownFrame, std::chrono::milliseconds(0)},
+       {AntennaTransformFailure::UnknownFrame, std::chrono::milliseconds(5100)}},
+      true},
+    FailureReportCase{
+      "UnknownFrameAfterSuccess",
+      {{AntennaTransformFailure::UnknownFrame, std::chrono::milliseconds(0)},
+       {std::nullopt, std::chrono::milliseconds(1000)},
+       {AntennaTransformFailure::UnknownFrame, std::chrono::milliseconds(5100)}},
+      false},
+    FailureReportCase{
+      "Unresolvable",
+      {{AntennaTransformFailure::Unresolvable, std::chrono::milliseconds(0)}},
+      true}),
+  [](const ::testing::TestParamInfo<FailureReportCase> & info) {
+    return std::string(info.param.name);
+  });

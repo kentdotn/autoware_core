@@ -14,8 +14,11 @@
 
 #include "gnss_poser_node.hpp"
 
+#include <tf2/time.hpp>
+
 #include <autoware_sensing_msgs/msg/gnss_ins_orientation_stamped.hpp>
 
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -26,6 +29,10 @@ namespace autoware::gnss_poser
 {
 namespace
 {
+// How long fixes may be skipped for an antenna frame that TF does not know before it is an error:
+// right after startup /tf_static may arrive after the first fixes.
+constexpr std::chrono::seconds antenna_frame_grace_period{5};
+
 GnssPosePubMethod to_gnss_pose_pub_method(const int value)
 {
   switch (value) {
@@ -48,11 +55,10 @@ GnssPoserNode::GnssPoserNode(const rclcpp::NodeOptions & node_options)
   tf2_listener_(tf2_buffer_, *this),
   tf2_broadcaster_(*this),
   base_frame_(declare_parameter<std::string>("base_frame")),
-  gnss_poser_(
-    declare_gnss_poser_params(),
-    [this](const std::string & gnss_frame, const builtin_interfaces::msg::Time & stamp) {
-      return get_static_transform(gnss_frame, base_frame_, stamp);
-    })
+  antenna_transform_failure_filter_(antenna_frame_grace_period),
+  gnss_poser_(declare_gnss_poser_params(), [this](const std::string & gnss_frame) {
+    return get_static_transform(gnss_frame, base_frame_);
+  })
 {
   // Subscribe to map_projector_info topic
   sub_map_projector_info_ = create_subscription<autoware_map_msgs::msg::MapProjectorInfo>(
@@ -125,6 +131,11 @@ void GnssPoserNode::callback_nav_sat_fix(
         "Buffering Position. Output Skipped.");
       break;
 
+    case GnssPoser::Outcome::NoAntennaTransform:
+      // The receiver has a position solution, which is what gnss_fixed reports; only the pose
+      // cannot be derived. get_static_transform() has already warned about the missing transform.
+      break;
+
     case GnssPoser::Outcome::Published:
       break;
   }
@@ -158,27 +169,42 @@ void GnssPoserNode::callback_gnss_ins_orientation_stamped(
 }
 
 std::optional<geometry_msgs::msg::Transform> GnssPoserNode::get_static_transform(
-  const std::string & target_frame, const std::string & source_frame,
-  const builtin_interfaces::msg::Time & stamp)
+  const std::string & target_frame, const std::string & source_frame)
 {
   if (target_frame == source_frame) {
     return geometry_msgs::msg::Transform{};  // identity: zero translation, rotation w = 1
   }
 
   try {
-    return tf2_buffer_
-      .lookupTransform(
-        target_frame, source_frame,
-        tf2::TimePoint(std::chrono::seconds(stamp.sec) + std::chrono::nanoseconds(stamp.nanosec)))
-      .transform;
-  } catch (tf2::TransformException & ex) {
-    RCLCPP_WARN_STREAM_THROTTLE(
-      this->get_logger(), *this->get_clock(), std::chrono::milliseconds(1000).count(), ex.what());
-    RCLCPP_WARN_STREAM_THROTTLE(
-      this->get_logger(), *this->get_clock(), std::chrono::milliseconds(1000).count(),
-      "Please publish TF " << target_frame.c_str() << " to " << source_frame.c_str());
-    return std::nullopt;
+    // tf2::TimePointZero asks for the latest transform. The antenna is rigidly mounted, so every
+    // sample of this transform carries the same value and the latest one applies to every fix.
+    // Asking for the fix stamp instead would fail whenever the relation is published on /tf rather
+    // than /tf_static and the fix is newer than the last /tf message, which tf2 refuses to
+    // extrapolate.
+    const geometry_msgs::msg::Transform transform =
+      tf2_buffer_.lookupTransform(target_frame, source_frame, tf2::TimePointZero).transform;
+    antenna_transform_failure_filter_.record_success();
+    return transform;
+  } catch (const tf2::LookupException & ex) {
+    report_transform_failure(AntennaTransformFailure::UnknownFrame, ex, target_frame, source_frame);
+  } catch (const tf2::TransformException & ex) {
+    report_transform_failure(AntennaTransformFailure::Unresolvable, ex, target_frame, source_frame);
   }
+  return std::nullopt;
+}
+
+void GnssPoserNode::report_transform_failure(
+  const AntennaTransformFailure failure, const tf2::TransformException & ex,
+  const std::string & target_frame, const std::string & source_frame)
+{
+  if (!antenna_transform_failure_filter_.record_failure(
+        failure, AntennaTransformFailureFilter::Clock::now())) {
+    return;
+  }
+  RCLCPP_ERROR_STREAM_THROTTLE(
+    this->get_logger(), *this->get_clock(), std::chrono::milliseconds(1000).count(),
+    ex.what() << ". Please publish TF " << target_frame << " to " << source_frame
+              << ". The fix is skipped.");
 }
 
 }  // namespace autoware::gnss_poser
