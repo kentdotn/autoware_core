@@ -38,6 +38,17 @@
           "default": "1",
           "minimum": 1,
           "description": "Number of positions the average / median is taken over (ignored for method 0)"
+        },
+        "antenna_transform_is_dynamic": {
+          "type": "boolean",
+          "default": "false",
+          "description": "Whether the antenna moves relative to base_frame. False: the latest transform is used for every fix. True: every fix waits for the transform stamped like it, which delays the output by up to antenna_transform_timeout_sec."
+        },
+        "antenna_transform_timeout_sec": {
+          "type": "number",
+          "default": "0.5",
+          "minimum": 0.0,
+          "description": "How long a fix waits for its antenna transform before it is dropped, measured between fix header stamps (only used when antenna_transform_is_dynamic is true)"
         }
       },
       "required": [
@@ -46,7 +57,9 @@
         "map_frame",
         "use_gnss_ins_orientation",
         "gnss_pose_pub_method",
-        "buff_epoch"
+        "buff_epoch",
+        "antenna_transform_is_dynamic",
+        "antenna_transform_timeout_sec"
       ]
     }
   },

@@ -16,6 +16,7 @@
 
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -31,7 +32,9 @@ struct DiagnosticsState
   bool latest_fix_is_fixed = true;  ///< false when the most recent fix had no position solution
   bool use_gnss_ins_orientation = true;
   bool ins_orientation_received = false;
-  bool antenna_transform_available = true;  ///< false when the last TF lookup failed
+  std::size_t pending_fix_count = 0;  ///< fixes held until their antenna transform arrives
+  /// The last fix that was evaluated produced no pose for lack of its antenna transform.
+  bool fixes_dropped_for_missing_transform = false;
   std::string antenna_frame;
   std::string base_frame;
 };
@@ -53,10 +56,10 @@ struct DiagnosticsResult
 
 /// \brief Evaluate the diagnostics state. Pure function: no node, clock or interface dependency.
 ///
-/// Missing inputs (fix, map projector info, INS orientation) and a fix without a position solution
-/// are WARN: they are expected transients. A local projector and an antenna transform that TF
-/// cannot provide are ERROR: both make every fix unusable, the first permanently and the second
-/// until the transform is published.
+/// Missing inputs (fix, map projector info, INS orientation), a fix without a position solution
+/// and fixes waiting for their antenna transform are WARN: they are expected transients. A local
+/// projector and fixes dropped for lack of their antenna transform are ERROR: the first makes
+/// every fix unusable, the second means TF does not carry the antenna frame of the fixes.
 DiagnosticsResult determine_diagnostics(const DiagnosticsState & state);
 }  // namespace autoware::gnss_poser
 

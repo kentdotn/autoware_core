@@ -32,6 +32,7 @@
 #include <boost/circular_buffer.hpp>
 
 #include <array>
+#include <cstddef>
 #include <functional>
 #include <optional>
 #include <string>
@@ -159,6 +160,12 @@ public:
     bool ins_orientation_received = false;  ///< false while the rmse 1.0 stand-in is in use
     std::size_t position_buffer_size = 0;
     std::optional<Outcome> latest_outcome;  ///< of the most recent input_fix(), if any
+    /// Fixes waiting for their antenna transform. Always 0 here; a caller that holds fixes back
+    /// reports its own count (see DynamicGnssPoser).
+    std::size_t pending_fix_count = 0;
+    /// The last fix that was evaluated produced no pose because its antenna transform was
+    /// missing.
+    bool fixes_dropped_for_missing_transform = false;
   };
   Status take_status() const;
 

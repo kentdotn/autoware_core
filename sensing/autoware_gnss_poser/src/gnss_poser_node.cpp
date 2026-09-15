@@ -20,17 +20,23 @@
 
 #include <autoware_sensing_msgs/msg/gnss_ins_orientation_stamped.hpp>
 
+#include <chrono>
 #include <cmath>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace autoware::gnss_poser
 {
 namespace
 {
+// How often a fix that waits for its antenna transform is retried. Only used when the antenna
+// moves; short enough to stay well inside one fix period at the usual GNSS rates.
+constexpr std::chrono::milliseconds transform_update_period{20};
+
 GnssPosePubMethod to_gnss_pose_pub_method(const int value)
 {
   switch (value) {
@@ -53,9 +59,7 @@ GnssPoserNode::GnssPoserNode(const rclcpp::NodeOptions & node_options)
   tf2_listener_(tf2_buffer_, *this),
   tf2_broadcaster_(*this),
   base_frame_(declare_parameter<std::string>("base_frame")),
-  gnss_poser_(declare_gnss_poser_params(), [this](const std::string & gnss_frame) {
-    return get_static_transform(gnss_frame, base_frame_);
-  })
+  gnss_poser_(make_gnss_poser())
 {
   // Subscribe to map_projector_info topic
   sub_map_projector_info_ = create_subscription<autoware_map_msgs::msg::MapProjectorInfo>(
@@ -86,6 +90,31 @@ GnssPoserNode::GnssPoserNode(const rclcpp::NodeOptions & node_options)
     std::bind(&GnssPoserNode::publish_diagnostics, this));
 }
 
+std::unique_ptr<GnssPoserInterface> GnssPoserNode::make_gnss_poser()
+{
+  const GnssPoserParams params = declare_gnss_poser_params();
+  const bool is_dynamic = declare_parameter<bool>("antenna_transform_is_dynamic");
+  const double timeout_sec = declare_parameter<double>("antenna_transform_timeout_sec");
+
+  if (!is_dynamic) {
+    return std::make_unique<StaticGnssPoser>(params, [this](const std::string & gnss_frame) {
+      return get_static_transform(gnss_frame, base_frame_);
+    });
+  }
+
+  // The antenna moves, so a fix waits for the transform stamped like it; the wait is polled
+  // because TF arrival is not observable, and it costs the poll period in latency.
+  transform_update_timer_ = autoware::agnocast_wrapper::create_timer(
+    this, this->get_clock(), transform_update_period,
+    [this]() { handle_results(gnss_poser_->input_transform_update()); });
+  return std::make_unique<DynamicGnssPoser>(
+    params,
+    [this](const std::string & gnss_frame, const builtin_interfaces::msg::Time & stamp) {
+      return get_transform_at(gnss_frame, base_frame_, stamp);
+    },
+    timeout_sec);
+}
+
 GnssPoserParams GnssPoserNode::declare_gnss_poser_params()
 {
   GnssPoserParams params;
@@ -101,7 +130,7 @@ GnssPoserParams GnssPoserNode::declare_gnss_poser_params()
 void GnssPoserNode::callback_map_projector_info(
   const AUTOWARE_MESSAGE_CONST_SHARED_PTR(autoware_map_msgs::msg::MapProjectorInfo) & msg)
 {
-  gnss_poser_.set_projector_info(*msg);
+  gnss_poser_->set_projector_info(*msg);
 }
 
 void GnssPoserNode::callback_nav_sat_fix(
@@ -109,8 +138,18 @@ void GnssPoserNode::callback_nav_sat_fix(
 {
   latest_fix_stamp_ = nav_sat_fix_msg_ptr->header.stamp;
   antenna_frame_ = nav_sat_fix_msg_ptr->header.frame_id;
-  const GnssPoser::Result result = gnss_poser_.input_fix(*nav_sat_fix_msg_ptr);
+  handle_results(gnss_poser_->input_fix(*nav_sat_fix_msg_ptr));
+}
 
+void GnssPoserNode::handle_results(const std::vector<GnssPoser::Result> & results)
+{
+  for (const GnssPoser::Result & result : results) {
+    handle_result(result);
+  }
+}
+
+void GnssPoserNode::handle_result(const GnssPoser::Result & result)
+{
   switch (result.outcome) {
     case GnssPoser::Outcome::NoProjectorInfo:
       RCLCPP_WARN_THROTTLE(
@@ -171,14 +210,13 @@ void GnssPoserNode::callback_gnss_ins_orientation_stamped(
   const AUTOWARE_MESSAGE_CONST_SHARED_PTR(autoware_sensing_msgs::msg::GnssInsOrientationStamped) &
   msg)
 {
-  gnss_poser_.set_ins_orientation(msg->orientation);
+  gnss_poser_->set_ins_orientation(msg->orientation);
 }
 
 std::optional<geometry_msgs::msg::Transform> GnssPoserNode::get_static_transform(
   const std::string & target_frame, const std::string & source_frame)
 {
   if (target_frame == source_frame) {
-    antenna_transform_available_ = true;
     return geometry_msgs::msg::Transform{};  // identity: zero translation, rotation w = 1
   }
 
@@ -188,12 +226,8 @@ std::optional<geometry_msgs::msg::Transform> GnssPoserNode::get_static_transform
     // Asking for the fix stamp instead would fail whenever the relation is published on /tf rather
     // than /tf_static and the fix is newer than the last /tf message, which tf2 refuses to
     // extrapolate.
-    const geometry_msgs::msg::Transform transform =
-      tf2_buffer_.lookupTransform(target_frame, source_frame, tf2::TimePointZero).transform;
-    antenna_transform_available_ = true;
-    return transform;
+    return tf2_buffer_.lookupTransform(target_frame, source_frame, tf2::TimePointZero).transform;
   } catch (const tf2::TransformException & ex) {
-    antenna_transform_available_ = false;
     RCLCPP_WARN_STREAM_THROTTLE(
       this->get_logger(), *this->get_clock(), std::chrono::milliseconds(1000).count(),
       ex.what() << ". Please publish TF " << target_frame << " to " << source_frame
@@ -202,9 +236,30 @@ std::optional<geometry_msgs::msg::Transform> GnssPoserNode::get_static_transform
   }
 }
 
+std::optional<geometry_msgs::msg::Transform> GnssPoserNode::get_transform_at(
+  const std::string & target_frame, const std::string & source_frame,
+  const builtin_interfaces::msg::Time & stamp)
+{
+  if (target_frame == source_frame) {
+    return geometry_msgs::msg::Transform{};  // identity: zero translation, rotation w = 1
+  }
+
+  try {
+    return tf2_buffer_
+      .lookupTransform(
+        target_frame, source_frame,
+        tf2::TimePoint(std::chrono::seconds(stamp.sec) + std::chrono::nanoseconds(stamp.nanosec)))
+      .transform;
+  } catch (const tf2::TransformException &) {
+    // Not available (yet). The fix waits for it, and the queue decides when to give up; the
+    // diagnostics report both states, so a throttled log per attempt would only add noise.
+    return std::nullopt;
+  }
+}
+
 void GnssPoserNode::publish_diagnostics()
 {
-  const GnssPoser::Status status = gnss_poser_.take_status();
+  const GnssPoser::Status status = gnss_poser_->take_status();
 
   diagnostics_->clear();
   diagnostics_->add_key_value("is_arrived_first_fix", latest_fix_stamp_.has_value());
@@ -218,7 +273,9 @@ void GnssPoserNode::publish_diagnostics()
     "latest_outcome",
     status.latest_outcome ? std::string(to_string(*status.latest_outcome)) : std::string("None"));
   diagnostics_->add_key_value("position_buffer_size", status.position_buffer_size);
-  diagnostics_->add_key_value("is_antenna_transform_available", antenna_transform_available_);
+  diagnostics_->add_key_value("pending_fix_count", status.pending_fix_count);
+  diagnostics_->add_key_value(
+    "is_dropping_fixes_for_missing_transform", status.fixes_dropped_for_missing_transform);
 
   DiagnosticsState state;
   state.fix_arrived = latest_fix_stamp_.has_value();
@@ -227,7 +284,8 @@ void GnssPoserNode::publish_diagnostics()
   state.latest_fix_is_fixed = status.latest_outcome != GnssPoser::Outcome::NotFixed;
   state.use_gnss_ins_orientation = status.use_gnss_ins_orientation;
   state.ins_orientation_received = status.ins_orientation_received;
-  state.antenna_transform_available = antenna_transform_available_;
+  state.pending_fix_count = status.pending_fix_count;
+  state.fixes_dropped_for_missing_transform = status.fixes_dropped_for_missing_transform;
   state.antenna_frame = antenna_frame_;
   state.base_frame = base_frame_;
 

@@ -75,3 +75,12 @@ processes:
       - periodic: 100ms
     outcomes:
       - to_output: diagnostics
+  # Only when antenna_transform_is_dynamic is true: hands out the fixes whose antenna transform
+  # has arrived since the last poll.
+  - name: process_pending_gnss_data
+    trigger_conditions:
+      - periodic: 20ms
+    outcomes:
+      - to_output: gnss_pose
+      - to_output: gnss_pose_cov
+      - to_output: gnss_fixed

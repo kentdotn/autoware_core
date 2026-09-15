@@ -336,6 +336,7 @@ GnssPoser::Status GnssPoser::take_status() const
     projector_info_.projector_type == autoware_map_msgs::msg::MapProjectorInfo::LOCAL;
   status.ins_orientation_received = ins_orientation_received_;
   status.position_buffer_size = position_buffer_.size();
+  status.fixes_dropped_for_missing_transform = latest_outcome_ == Outcome::NoAntennaTransform;
   status.latest_outcome = latest_outcome_;
   return status;
 }

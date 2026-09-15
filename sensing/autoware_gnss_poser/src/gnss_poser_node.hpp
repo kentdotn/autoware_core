@@ -14,7 +14,10 @@
 #ifndef GNSS_POSER_NODE_HPP_
 #define GNSS_POSER_NODE_HPP_
 
+#include "dynamic_gnss_poser.hpp"
 #include "gnss_poser.hpp"
+#include "gnss_poser_interface.hpp"
+#include "static_gnss_poser.hpp"
 
 #include <autoware/agnocast_wrapper/node.hpp>
 #include <autoware/agnocast_wrapper/tf2.hpp>
@@ -35,6 +38,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace autoware::gnss_poser
 {
@@ -47,6 +51,8 @@ public:
 
 private:
   GnssPoserParams declare_gnss_poser_params();
+  // Static or dynamic, according to the antenna_transform_is_dynamic parameter.
+  std::unique_ptr<GnssPoserInterface> make_gnss_poser();
 
   void callback_map_projector_info(
     const AUTOWARE_MESSAGE_CONST_SHARED_PTR(autoware_map_msgs::msg::MapProjectorInfo) & msg);
@@ -61,7 +67,15 @@ private:
   // the latest one is the one that applies to every fix.
   std::optional<geometry_msgs::msg::Transform> get_static_transform(
     const std::string & target_frame, const std::string & source_frame);
-  // Publish the messages the pose computation produced.
+  // The transform between the two frames at `stamp`, or std::nullopt when TF cannot provide it
+  // yet. Used when the antenna moves, where the transform of a fix is the one stamped like it.
+  // Silent: a transform that is not available yet is the normal case there, and the fix waits.
+  std::optional<geometry_msgs::msg::Transform> get_transform_at(
+    const std::string & target_frame, const std::string & source_frame,
+    const builtin_interfaces::msg::Time & stamp);
+  // Log what the pose computation made of one fix, and publish the messages it produced.
+  void handle_result(const GnssPoser::Result & result);
+  void handle_results(const std::vector<GnssPoser::Result> & results);
   void publish_data(const GnssPoser::Result & result);
   void publish_diagnostics();
 
@@ -80,17 +94,20 @@ private:
 
   const std::string base_frame_;
 
-  GnssPoser gnss_poser_;
+  std::unique_ptr<GnssPoserInterface> gnss_poser_;
 
   // Input facts the logic does not see, reported as diagnostics.
   std::optional<builtin_interfaces::msg::Time> latest_fix_stamp_;
-  std::string antenna_frame_;                // header.frame_id of the latest fix
-  bool antenna_transform_available_ = true;  // result of the latest TF lookup
+  std::string antenna_frame_;  // header.frame_id of the latest fix
 
   std::unique_ptr<
     autoware_utils_diagnostics::BasicDiagnosticsInterface<autoware::agnocast_wrapper::Node>>
     diagnostics_;
   AUTOWARE_TIMER_PTR diagnostics_timer_;
+  // Only when the antenna moves: asks the pose computation for the fixes whose transform has
+  // arrived. A transform-arrival callback would do this without the delay, but the TF listener
+  // offers none.
+  AUTOWARE_TIMER_PTR transform_update_timer_;
 };
 }  // namespace autoware::gnss_poser
 

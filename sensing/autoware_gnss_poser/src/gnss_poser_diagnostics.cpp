@@ -53,11 +53,14 @@ DiagnosticsResult determine_diagnostics(const DiagnosticsState & state)
       "autoware_orientation has not been received yet. The identity orientation with an rmse of "
       "1.0 rad is used.");
   }
-  if (!state.antenna_transform_available) {
+  if (state.fixes_dropped_for_missing_transform) {
     raise(
-      DiagnosticStatus::ERROR, "Please publish TF " + state.antenna_frame + " to " +
-                                 state.base_frame +
-                                 ". Fixes are skipped until the transform is available.");
+      DiagnosticStatus::ERROR, "Fixes are dropped because TF " + state.antenna_frame + " to " +
+                                 state.base_frame + " is not available. Please publish it.");
+  } else if (state.pending_fix_count > 0) {
+    raise(
+      DiagnosticStatus::WARN, "Waiting for TF " + state.antenna_frame + " to " + state.base_frame +
+                                " (" + std::to_string(state.pending_fix_count) + " fix(es) held).");
   }
   return result;
 }

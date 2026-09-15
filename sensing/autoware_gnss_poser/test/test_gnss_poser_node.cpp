@@ -122,13 +122,21 @@ struct NodeParams
   bool use_gnss_ins_orientation = true;
   int gnss_pose_pub_method = 0;
   int buff_epoch = 1;
+  bool antenna_transform_is_dynamic = false;
+  double antenna_transform_timeout_sec = 0.5;
 
-  // The six parameters the node declares, in declaration order.
+  // The eight parameters the node declares, in declaration order.
   static const std::vector<std::string> & names()
   {
     static const std::vector<std::string> parameter_names = {
-      "base_frame",           "gnss_base_frame", "map_frame", "use_gnss_ins_orientation",
-      "gnss_pose_pub_method", "buff_epoch"};
+      "base_frame",
+      "gnss_base_frame",
+      "map_frame",
+      "use_gnss_ins_orientation",
+      "gnss_pose_pub_method",
+      "buff_epoch",
+      "antenna_transform_is_dynamic",
+      "antenna_transform_timeout_sec"};
     return parameter_names;
   }
 
@@ -147,6 +155,8 @@ struct NodeParams
     add("use_gnss_ins_orientation", use_gnss_ins_orientation);
     add("gnss_pose_pub_method", gnss_pose_pub_method);
     add("buff_epoch", buff_epoch);
+    add("antenna_transform_is_dynamic", antenna_transform_is_dynamic);
+    add("antenna_transform_timeout_sec", antenna_transform_timeout_sec);
     return options;
   }
 };
@@ -804,7 +814,8 @@ TEST_F(GnssPoserNodeIntegration, Diagnostics_ReflectInputState)
   EXPECT_EQ(value_of(after, "is_arrived_first_fix"), "True");
   EXPECT_EQ(value_of(after, "is_arrived_first_orientation"), "True");
   EXPECT_EQ(value_of(after, "latest_outcome"), "Published");
-  EXPECT_EQ(value_of(after, "is_antenna_transform_available"), "True");
+  EXPECT_EQ(value_of(after, "pending_fix_count"), "0");
+  EXPECT_EQ(value_of(after, "is_dropping_fixes_for_missing_transform"), "False");
 }
 
 // =======================================================================================
@@ -961,6 +972,43 @@ TEST_F(GnssPoserNodeIntegration, Tf_LookupUsesTheLatestTransform)
   send_fix(fix_zero);
   ASSERT_NO_FATAL_FAILURE(wait_for_outputs(3));
   expect_point_near(last_pose().pose.position, expected);
+}
+
+// With antenna_transform_is_dynamic, a fix is not answered when it arrives but when its own
+// transform can be looked up: the fix that arrives before any transform publishes nothing, not
+// even `gnss_fixed`, and produces every output once the transform stamped like it arrives. The
+// node polls for that, so the output follows within a few tens of milliseconds.
+//
+// This is the opt-in mode for an antenna that moves relative to base_frame; the default mode is
+// pinned by the cases above.
+TEST_F(GnssPoserNodeIntegration, Dynamic_FixWaitsForTheTransformOfItsOwnStamp)
+{
+  NodeParams params;
+  params.gnss_pose_pub_method = 0;
+  params.use_gnss_ins_orientation = true;
+  params.base_frame = "my_base";
+  params.antenna_transform_is_dynamic = true;
+  ASSERT_NO_FATAL_FAILURE(build_node(params));
+  const auto projector = make_mgrs_projector_info();
+  send_projector_info(projector);
+  send_orientation(make_orientation(0.0));
+
+  const auto t0 = make_stamp(1000, 0);
+  auto fix = make_reference_fix(NavSatStatus::STATUS_FIX, "my_antenna");
+  fix.header.stamp = t0;
+  send_fix(fix);
+  expect_output_counts(0, 0, 0, 0);  // held, not skipped
+
+  ASSERT_NO_FATAL_FAILURE(broadcast_timed_tf(
+    "my_antenna", "my_base", make_point(1.0, 0.0, 0.0), yaw_to_quaternion(0.0), t0));
+  ASSERT_NO_FATAL_FAILURE(wait_for_outputs(1));
+
+  expect_output_counts(1, 1, 1, 1);
+  const auto projected = project_antenna(fix, projector);
+  expect_point_near(
+    last_pose().pose.position, make_point(projected.x + 1.0, projected.y, projected.z));
+  EXPECT_EQ(last_pose().header.stamp, t0);
+  EXPECT_TRUE(last_fixed().data);
 }
 
 int main(int argc, char ** argv)
