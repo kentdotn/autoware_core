@@ -55,8 +55,8 @@ struct DiagnosticsResult
 ///
 /// Missing inputs (fix, map projector info, INS orientation) and a fix without a position solution
 /// are WARN: they are expected transients. A local projector and an antenna transform that TF
-/// cannot provide are ERROR: the first makes every fix unusable, the second makes the node publish
-/// the antenna pose as the base_link pose.
+/// cannot provide are ERROR: both make every fix unusable, the first permanently and the second
+/// until the transform is published.
 DiagnosticsResult determine_diagnostics(const DiagnosticsState & state);
 }  // namespace autoware::gnss_poser
 

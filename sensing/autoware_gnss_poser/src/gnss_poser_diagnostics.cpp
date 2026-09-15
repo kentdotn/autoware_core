@@ -57,7 +57,7 @@ DiagnosticsResult determine_diagnostics(const DiagnosticsState & state)
     raise(
       DiagnosticStatus::ERROR, "Please publish TF " + state.antenna_frame + " to " +
                                  state.base_frame +
-                                 ". The antenna pose is published as the base_link pose.");
+                                 ". Fixes are skipped until the transform is available.");
   }
   return result;
 }

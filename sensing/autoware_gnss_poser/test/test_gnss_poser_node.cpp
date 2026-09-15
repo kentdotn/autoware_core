@@ -693,9 +693,10 @@ TEST_F(GnssPoserNodeIntegration, Interface_TopicsAndQos)
 // The node maps every outcome of GnssPoser::input_fix() to its topics: a fix before any projector
 // info or under a LOCAL projector publishes nothing (not even `gnss_fixed`), a fix without a
 // position solution publishes `gnss_fixed = false` only, a fix that only fills the position buffer
-// publishes `gnss_fixed = true` only, and a fix that yields a pose publishes all four outputs with
-// the fix header stamp, `map_frame` as frame_id and `gnss_base_frame` as the TF child frame. The
-// arrival of projector info publishes nothing by itself: dropped fixes are not replayed.
+// or whose antenna transform is missing publishes `gnss_fixed = true` only, and a fix that yields
+// a pose publishes all four outputs with the fix header stamp, `map_frame` as frame_id and
+// `gnss_base_frame` as the TF child frame. The arrival of projector info or of the antenna
+// transform publishes nothing by itself: dropped fixes are not replayed.
 //
 // The pose value is the logic's business (test_gnss_poser.cpp); one golden position check remains
 // here to show that the projector info and the fix reach the logic unchanged.
@@ -732,10 +733,21 @@ TEST_F(GnssPoserNodeIntegration, Outcome_DrivesWhatIsPublished)
   expect_output_counts(2, 0, 0, 0);
   EXPECT_TRUE(last_fixed().data);
 
-  // Published: all four outputs, every one stamped with the fix header stamp.
+  // NoAntennaTransform: the buffer is full now, but no transform from the fix frame to base_link
+  // has been published, so again gnss_fixed = true and nothing else.
+  send_fix(fix);
+  ASSERT_NO_FATAL_FAILURE(wait_for_gnss_fixed(3));
+  expect_output_counts(3, 0, 0, 0);
+  EXPECT_TRUE(last_fixed().data);
+
+  // Published: with the transform available, all four outputs, every one stamped with the fix
+  // header stamp. The transform is the identity, so the pose is the projected antenna position.
+  ASSERT_NO_FATAL_FAILURE(broadcast_static_tf(
+    fix.header.frame_id, "base_link", make_point(0.0, 0.0, 0.0), yaw_to_quaternion(0.0)));
+  expect_output_counts(3, 0, 0, 0);  // the dropped fix is not replayed
   send_fix(fix);
   ASSERT_NO_FATAL_FAILURE(wait_for_outputs(1));
-  expect_output_counts(3, 1, 1, 1);
+  expect_output_counts(4, 1, 1, 1);
   EXPECT_TRUE(last_fixed().data);
   EXPECT_EQ(last_fixed().stamp, fix.header.stamp);
 
@@ -851,16 +863,11 @@ TEST_F(GnssPoserNodeIntegration, Tf_StaticAntennaToBaseTransform_IsComposedAndBr
   EXPECT_EQ(peer_->broadcast_tfs.size(), 1U);
 }
 
-// The antenna frame is the fix's `header.frame_id`. A frame with no transform to base_frame, or a
-// frame equal to base_frame, yields the antenna pose unchanged (identity fallback); a known frame
-// gets the transform applied.
-//
-// NOTE(characterization): the unknown-frame case is a configuration error (the driver's frame_id
-// does not match any TF frame) that never resolves by waiting, yet the node keeps publishing the
-// antenna position as base_link, with the receiver's covariance and only a throttled warning. The
-// node does not distinguish this from a transform that is merely not available yet. The
-// frame_id == base_frame shortcut, by contrast, is a legitimate configuration.
-TEST_F(GnssPoserNodeIntegration, Tf_AntennaFrameComesFromFixHeader_UnknownFrameFallsBackToIdentity)
+// The antenna frame is the fix's `header.frame_id`. A frame with no transform to base_frame drops
+// the fix: the pose cannot be expressed in base_link, and `gnss_fixed` still reports the receiver's
+// status. A frame equal to base_frame needs no lookup and yields the antenna pose unchanged; a
+// known frame gets the transform applied.
+TEST_F(GnssPoserNodeIntegration, Tf_AntennaFrameComesFromFixHeader_UnknownFrameDropsTheFix)
 {
   NodeParams params;
   params.gnss_pose_pub_method = 0;
@@ -873,39 +880,41 @@ TEST_F(GnssPoserNodeIntegration, Tf_AntennaFrameComesFromFixHeader_UnknownFrameF
   ASSERT_NO_FATAL_FAILURE(broadcast_static_tf(
     "my_antenna", "my_base", make_point(1.0, 2.0, 0.5), yaw_to_quaternion(0.0)));
 
-  // Frame from the header is what gets looked up; a frame without TF yields the antenna pose.
+  // Frame from the header is what gets looked up; a frame without TF drops the fix.
   const auto fix_unknown = make_reference_fix(NavSatStatus::STATUS_FIX, "some_other_antenna");
   send_fix(fix_unknown);
-  ASSERT_NO_FATAL_FAILURE(wait_for_outputs(1));
-  expect_point_near(last_pose().pose.position, project_antenna(fix_unknown, projector));
-  EXPECT_NEAR(yaw_of(last_pose().pose.orientation), M_PI / 2.0, angle_tolerance);
+  ASSERT_NO_FATAL_FAILURE(wait_for_gnss_fixed(1));
+  expect_output_counts(1, 0, 0, 0);
+  EXPECT_TRUE(last_fixed().data);
 
   // Same frame as base_frame: no lookup, identity.
   const auto fix_base = make_reference_fix(NavSatStatus::STATUS_FIX, "my_base");
   send_fix(fix_base);
-  ASSERT_NO_FATAL_FAILURE(wait_for_outputs(2));
+  ASSERT_NO_FATAL_FAILURE(wait_for_outputs(1));
   expect_point_near(last_pose().pose.position, project_antenna(fix_base, projector));
+  EXPECT_NEAR(yaw_of(last_pose().pose.orientation), M_PI / 2.0, angle_tolerance);
 
   // Known frame: the TF is applied (positive control).
   const auto fix_known = make_reference_fix(NavSatStatus::STATUS_FIX, "my_antenna");
   send_fix(fix_known);
-  ASSERT_NO_FATAL_FAILURE(wait_for_outputs(3));
+  ASSERT_NO_FATAL_FAILURE(wait_for_outputs(2));
   const auto antenna = project_antenna(fix_known, projector);
   expect_point_near(
     last_pose().pose.position, make_point(antenna.x - 2.0, antenna.y + 1.0, antenna.z + 0.5));
 }
 
-// The antenna -> base transform is looked up at the fix's header stamp, not at "latest". With a
-// transform published on /tf (time-stamped, unlike /tf_static) at exactly t0: a fix stamped t0 gets
-// it applied, a fix stamped one second later needs extrapolation, which tf2 refuses, so the node
-// falls back to identity, and a fix with a zero stamp means "latest" to tf2 and gets it applied
-// again.
+// The antenna -> base transform is looked up as "latest" (tf2::TimePointZero), not at the fix's
+// header stamp. With a transform published on /tf (time-stamped, unlike /tf_static) at exactly t0,
+// a fix stamped t0, a fix stamped one second later and a fix with a zero stamp all get the same
+// transform applied; a lookup at the header stamp would have to extrapolate for the second one,
+// which tf2 refuses. A fix that arrives before any transform is dropped, and is not replayed once
+// the transform arrives.
 //
 // The antenna sits rigidly on the vehicle and is normally published on /tf_static, where time is
-// ignored; a time-stamped transform is the only way to observe which time the node asks for. What
-// this pins is the lookup policy, which decides how the node reacts when the receiver's clock and
-// the TF clock disagree.
-TEST_F(GnssPoserNodeIntegration, Tf_LookupIsAtFixHeaderStamp)
+// ignored; /tf is used here because a time-stamped transform is the only way to observe which time
+// the node asks for. It is also the configuration the "latest" lookup exists for: the same static
+// relation published on /tf, where the receiver's clock and the TF clock need not agree.
+TEST_F(GnssPoserNodeIntegration, Tf_LookupUsesTheLatestTransform)
 {
   NodeParams params;
   params.gnss_pose_pub_method = 0;
@@ -917,34 +926,41 @@ TEST_F(GnssPoserNodeIntegration, Tf_LookupIsAtFixHeaderStamp)
   send_orientation(make_orientation(0.0));
 
   const auto t0 = make_stamp(1000, 0);
-  ASSERT_NO_FATAL_FAILURE(broadcast_timed_tf(
-    "my_antenna", "my_base", make_point(1.0, 0.0, 0.0), yaw_to_quaternion(0.0), t0));
 
-  const auto projected = project_antenna(make_reference_fix(), projector);
-
-  // Fix stamped exactly at t0: transform found and applied.
+  // Before any transform is published: the fix is dropped, gnss_fixed only.
   auto fix_at_t0 = make_reference_fix(NavSatStatus::STATUS_FIX, "my_antenna");
   fix_at_t0.header.stamp = t0;
   send_fix(fix_at_t0);
-  ASSERT_NO_FATAL_FAILURE(wait_for_outputs(1));
-  expect_point_near(
-    last_pose().pose.position, make_point(projected.x + 1.0, projected.y, projected.z));
+  ASSERT_NO_FATAL_FAILURE(wait_for_gnss_fixed(1));
+  expect_output_counts(1, 0, 0, 0);
 
-  // Fix stamped 1 s later: lookup needs extrapolation, fails, and falls back to identity.
+  ASSERT_NO_FATAL_FAILURE(broadcast_timed_tf(
+    "my_antenna", "my_base", make_point(1.0, 0.0, 0.0), yaw_to_quaternion(0.0), t0));
+  expect_output_counts(1, 0, 0, 0);  // the dropped fix is not replayed
+
+  const auto projected = project_antenna(make_reference_fix(), projector);
+  const auto expected = make_point(projected.x + 1.0, projected.y, projected.z);
+
+  // Fix stamped exactly at t0: transform found and applied.
+  send_fix(fix_at_t0);
+  ASSERT_NO_FATAL_FAILURE(wait_for_outputs(1));
+  expect_point_near(last_pose().pose.position, expected);
+
+  // Fix stamped 1 s later: a lookup at the header stamp would need extrapolation, which tf2
+  // refuses; the latest transform applies all the same.
   auto fix_later = fix_at_t0;
   fix_later.header.stamp = make_stamp(1001, 0);
   send_fix(fix_later);
   ASSERT_NO_FATAL_FAILURE(wait_for_outputs(2));
-  expect_point_near(last_pose().pose.position, projected);
+  expect_point_near(last_pose().pose.position, expected);
   EXPECT_EQ(last_pose().header.stamp, fix_later.header.stamp);
 
-  // Fix with a zero stamp: tf2 treats time 0 as "latest", so the transform is applied again.
+  // Fix with a zero stamp: tf2 treats time 0 as "latest" too, so nothing changes.
   auto fix_zero = fix_at_t0;
   fix_zero.header.stamp = make_stamp(0, 0);
   send_fix(fix_zero);
   ASSERT_NO_FATAL_FAILURE(wait_for_outputs(3));
-  expect_point_near(
-    last_pose().pose.position, make_point(projected.x + 1.0, projected.y, projected.z));
+  expect_point_near(last_pose().pose.position, expected);
 }
 
 int main(int argc, char ** argv)

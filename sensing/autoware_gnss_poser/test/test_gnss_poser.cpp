@@ -186,18 +186,15 @@ Transform make_transform(double x, double y, double z, double yaw = 0.0)
 // A lookup that always succeeds with the given transform.
 GnssPoser::TransformLookup constant_lookup(const Transform & transform)
 {
-  return [transform](const std::string &, const builtin_interfaces::msg::Time &) {
-    return std::optional<Transform>(transform);
-  };
+  return [transform](const std::string &) { return std::optional<Transform>(transform); };
 }
 
 const GnssPoser::TransformLookup identity_lookup = constant_lookup(Transform{});
 
 // A lookup that never finds a transform.
-const GnssPoser::TransformLookup missing_lookup =
-  [](const std::string &, const builtin_interfaces::msg::Time &) {
-    return std::optional<Transform>();
-  };
+const GnssPoser::TransformLookup missing_lookup = [](const std::string &) {
+  return std::optional<Transform>();
+};
 
 // A GnssPoser ready to publish: MGRS projector info received, identity lookup unless given.
 GnssPoser make_ready_poser(
@@ -652,19 +649,17 @@ TEST(GnssPoser, MotionOrientationWithBufferUsesFilteredPositions)
 // ---------------------------------------------------------------------------------------------
 // Antenna transform
 
-// The lookup receives the fix header frame and stamp, and is called only once a pose is composed.
-TEST(GnssPoser, LookupReceivesFixFrameAndStampOnlyWhenComposing)
+// The lookup receives the fix header frame, and is called only once a pose is composed.
+TEST(GnssPoser, LookupReceivesFixFrameOnlyWhenComposing)
 {
-  std::vector<std::pair<std::string, builtin_interfaces::msg::Time>> calls;
-  GnssPoser poser = make_ready_poser(
-    make_params(GnssPosePubMethod::Average, 2),
-    [&](const std::string & frame, const builtin_interfaces::msg::Time & stamp) {
-      calls.emplace_back(frame, stamp);
+  std::vector<std::string> calls;
+  GnssPoser poser =
+    make_ready_poser(make_params(GnssPosePubMethod::Average, 2), [&](const std::string & frame) {
+      calls.push_back(frame);
       return std::optional<Transform>(Transform{});
     });
   NavSatFix fix = make_reference_fix();
   fix.header.frame_id = "antenna_frame";
-  fix.header.stamp = make_stamp(1234, 5678U);
 
   EXPECT_EQ(
     poser.input_fix(make_reference_fix(NavSatStatus::STATUS_NO_FIX)).outcome, Outcome::NotFixed);
@@ -673,8 +668,7 @@ TEST(GnssPoser, LookupReceivesFixFrameAndStampOnlyWhenComposing)
 
   EXPECT_EQ(poser.input_fix(fix).outcome, Outcome::Published);
   ASSERT_EQ(calls.size(), 1U);
-  EXPECT_EQ(calls[0].first, "antenna_frame");
-  EXPECT_EQ(calls[0].second, make_stamp(1234, 5678U));
+  EXPECT_EQ(calls[0], "antenna_frame");
 }
 
 // The base_link pose is the antenna pose composed with the looked-up transform: the translation
@@ -695,16 +689,30 @@ TEST(GnssPoser, ComposesAntennaPoseWithLookedUpTransform)
   expect_same_rotation(pose_with_covariance.pose.orientation, yaw_to_quaternion(M_PI / 2.0));
 }
 
-// When the lookup cannot provide the transform, the antenna pose is published as the base_link
-// pose (identity transform).
-TEST(GnssPoser, MissingTransformPublishesAntennaPose)
+// When the lookup cannot provide the transform, the fix yields no pose. It has still been
+// observed: it stays in the position buffer, and the next fix is published once the transform
+// becomes available.
+TEST(GnssPoser, MissingTransformIsNoAntennaTransform)
 {
-  GnssPoser poser = make_ready_poser(make_params(), missing_lookup);
+  std::optional<Transform> available;  // no transform until it is assigned
+  GnssPoser poser = make_ready_poser(
+    make_params(GnssPosePubMethod::Average, 1),
+    [&available](const std::string &) { return available; });
 
+  const auto result = poser.input_fix(make_reference_fix());
+
+  EXPECT_EQ(result.outcome, Outcome::NoAntennaTransform);
+  EXPECT_FALSE(result.gnss_pose.has_value());
+  // The receiver had a position solution; only the pose could not be derived from it.
+  ASSERT_TRUE(result.gnss_fixed.has_value());
+  EXPECT_TRUE(result.gnss_fixed->data);
+  EXPECT_EQ(poser.take_status().position_buffer_size, 1U);
+
+  available = make_transform(1.0, 2.0, 3.0);
   const auto pose_with_covariance = published(poser.input_fix(make_reference_fix()));
-
   expect_point_near(
-    pose_with_covariance.pose.position, make_point(golden_x, golden_y, reference_altitude));
+    pose_with_covariance.pose.position,
+    make_point(golden_x + 1.0, golden_y + 2.0, reference_altitude + 3.0));
 }
 
 // ---------------------------------------------------------------------------------------------
