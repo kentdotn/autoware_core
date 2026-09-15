@@ -28,6 +28,7 @@
 #include <cassert>
 #include <cmath>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -285,12 +286,16 @@ GnssPoser::Result GnssPoser::process_fix(const sensor_msgs::msg::NavSatFix & fix
 
   gnss_antenna_pose.orientation = orientation;
 
-  // get TF from gnss_antenna to base_link. If it cannot be obtained, the antenna pose is published
-  // as the base_link pose, i.e. the identity transform is used (a default-constructed Transform has
-  // zero translation and rotation w = 1).
-  const geometry_msgs::msg::Transform antenna_to_base_link =
-    lookup_antenna_to_base_link_(fix.header.frame_id, fix.header.stamp)
-      .value_or(geometry_msgs::msg::Transform{});
+  // get TF from gnss_antenna to base_link. Without it the fix cannot be expressed as a base_link
+  // pose, so it is dropped. The transform is static, so this does not resolve by asking for
+  // another time; it resolves once the transform is published.
+  const std::optional<geometry_msgs::msg::Transform> antenna_to_base_link =
+    lookup_antenna_to_base_link_(fix.header.frame_id);
+  if (!antenna_to_base_link) {
+    return {
+      Outcome::NoAntennaTransform, make_gnss_fixed(fix.header.stamp, true), std::nullopt,
+      std::nullopt, std::nullopt};
+  }
 
   std::array<double, 3> rotation_variances{};
   if (params_.use_gnss_ins_orientation) {
@@ -303,7 +308,7 @@ GnssPoser::Result GnssPoser::process_fix(const sensor_msgs::msg::NavSatFix & fix
 
   geometry_msgs::msg::PoseWithCovariance gnss_base_pose_with_covariance;
   gnss_base_pose_with_covariance.pose =
-    compose_base_link_pose(gnss_antenna_pose, antenna_to_base_link);
+    compose_base_link_pose(gnss_antenna_pose, *antenna_to_base_link);
   gnss_base_pose_with_covariance.covariance =
     make_pose_covariance(fix, rotation_variances, covariance_defaults_.unknown_position_variances);
 
@@ -346,6 +351,8 @@ const char * to_string(const GnssPoser::Outcome outcome)
       return "NotFixed";
     case GnssPoser::Outcome::Buffering:
       return "Buffering";
+    case GnssPoser::Outcome::NoAntennaTransform:
+      return "NoAntennaTransform";
     case GnssPoser::Outcome::Published:
       return "Published";
   }

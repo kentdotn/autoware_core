@@ -90,14 +90,16 @@ struct GnssPoserCovarianceDefaults
 class GnssPoser
 {
 public:
-  /// \brief Resolves the transform from the antenna frame named in the fix header to base_link at
-  /// the fix header stamp, or std::nullopt when it cannot be resolved.
+  /// \brief Resolves the transform from the antenna frame named in the fix header to base_link,
+  /// or std::nullopt when it cannot be resolved.
   ///
-  /// input_fix() calls it only for a fix that passed the gates and the buffering, right before the
-  /// pose is composed. Obtaining the transform (TF lookup, logging) is the caller's business; what
-  /// to do when there is none is decided here.
-  using TransformLookup = std::function<std::optional<geometry_msgs::msg::Transform>(
-    const std::string & antenna_frame, const builtin_interfaces::msg::Time & stamp)>;
+  /// The antenna is rigidly mounted on the vehicle, so this transform does not change over time
+  /// and no stamp is passed; a moving antenna is out of scope. input_fix() calls the lookup only
+  /// for a fix that passed the gates and the buffering, right before the pose is composed.
+  /// Obtaining the transform (TF lookup, logging) is the caller's business; what to do when there
+  /// is none is decided here.
+  using TransformLookup =
+    std::function<std::optional<geometry_msgs::msg::Transform>(const std::string & antenna_frame)>;
 
   /// \param lookup_antenna_to_base_link see TransformLookup; kept for the lifetime of the object.
   /// \param covariance_defaults see GnssPoserCovarianceDefaults; the node leaves it at its
@@ -113,7 +115,8 @@ public:
     LocalProjector,   ///< the map uses a local projector, so a GNSS fix cannot be converted
     NotFixed,         ///< the receiver reports no fix; its status is known but no pose is computed
     Buffering,        ///< the position buffer is not full yet (average and median methods)
-    Published,        ///< a pose was computed, see Result::gnss_pose
+    NoAntennaTransform,  ///< the antenna frame of the fix cannot be transformed to base_link
+    Published,           ///< a pose was computed, see Result::gnss_pose
   };
 
   /// \brief What the fix produced, as the messages to publish.
@@ -143,7 +146,8 @@ public:
   void set_ins_orientation(const autoware_sensing_msgs::msg::GnssInsOrientation & orientation);
 
   /// \brief Process one fix: gate, project, buffer, orient, compose with the antenna transform and
-  /// attach the covariance.
+  /// attach the covariance. A fix whose antenna transform cannot be resolved is dropped; it has
+  /// still been observed, so the position buffer and the motion orientation take it into account.
   Result input_fix(const sensor_msgs::msg::NavSatFix & fix);
 
   /// \brief Snapshot of the state the caller reports as diagnostics.

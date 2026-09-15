@@ -49,7 +49,6 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
-#include <utility>
 #include <vector>
 
 namespace
@@ -407,12 +406,11 @@ void expect_rotation_variances_near(
   EXPECT_NEAR(covariance[cov_yaw_yaw], yaw, rmse_squared_tolerance);
 }
 
-// The fixes of these cases carry the frame `gnss`, for which the node had no transform and
-// composed with the identity; the lookup that stands in for TF provides the identity directly.
-const GnssPoser::TransformLookup identity_lookup =
-  [](const std::string &, const builtin_interfaces::msg::Time &) {
-    return std::optional<Transform>(Transform{});
-  };
+// The lookup that stands in for TF provides the identity, so that the cases taken from the node
+// characterization stay about what they check rather than about the antenna transform.
+const GnssPoser::TransformLookup identity_lookup = [](const std::string &) {
+  return std::optional<Transform>(Transform{});
+};
 
 // A GnssPoser that has received the MGRS projector info.
 GnssPoser make_poser_with_mgrs_projector(const GnssPoserParams & params)
@@ -1250,47 +1248,64 @@ TEST(GnssPoser, Covariance_InjectedDefaults_InsPlaceholderRmseIsUsed)
   EXPECT_DOUBLE_EQ(covariance_of(result)[cov_yaw_yaw], 0.25);
 }
 
-// The lookup is asked for the transform of the fix header frame at the fix header stamp.
-TEST(GnssPoser, Tf_Lookup_ReceivesFixFrameAndStamp)
+// The lookup is asked for the transform of the fix header frame. The antenna is rigidly mounted, so
+// no stamp is passed.
+TEST(GnssPoser, Tf_Lookup_ReceivesFixFrame)
 {
   // Arrange
-  std::vector<std::pair<std::string, builtin_interfaces::msg::Time>> lookups;
-  GnssPoser poser(
-    {}, [&lookups](const std::string & frame, const builtin_interfaces::msg::Time & stamp) {
-      lookups.emplace_back(frame, stamp);
-      return std::optional<Transform>(Transform{});
-    });
+  std::vector<std::string> lookups;
+  GnssPoser poser({}, [&lookups](const std::string & frame) {
+    lookups.push_back(frame);
+    return std::optional<Transform>(Transform{});
+  });
   poser.set_projector_info(make_mgrs_projector_info());
   auto fix = make_reference_fix();
   fix.header.frame_id = "my_antenna";
-  fix.header.stamp.sec = 1234;
-  fix.header.stamp.nanosec = 5678U;
 
   // Act
   poser.input_fix(fix);
 
   // Assert
   ASSERT_EQ(lookups.size(), 1U);
-  EXPECT_EQ(lookups[0].first, "my_antenna");
-  EXPECT_EQ(lookups[0].second, fix.header.stamp);
+  EXPECT_EQ(lookups[0], "my_antenna");
 }
 
-// A transform the lookup cannot provide is replaced by the identity: the antenna pose is published
-// as the base_link pose.
-TEST(GnssPoser, Tf_MissingTransform_PublishesAntennaPose)
+// Without the antenna transform the fix cannot be expressed as a base_link pose, so it is dropped.
+// The receiver had a position solution, so its status is still reported.
+TEST(GnssPoser, Tf_MissingTransform_PublishesOnlyGnssFixed)
 {
   // Arrange
-  GnssPoser poser({}, [](const std::string &, const builtin_interfaces::msg::Time &) {
-    return std::optional<Transform>();
-  });
+  GnssPoser poser({}, [](const std::string &) { return std::optional<Transform>(); });
   poser.set_projector_info(make_mgrs_projector_info());
-  const auto fix = make_reference_fix();
 
   // Act
-  const auto result = poser.input_fix(fix);
+  const auto result = poser.input_fix(make_reference_fix());
 
   // Assert
-  expect_point_near(pose_of(result).position, project_mgrs(fix));
+  EXPECT_EQ(result.outcome, GnssPoser::Outcome::NoAntennaTransform);
+  expect_only_gnss_fixed(result);
+  EXPECT_TRUE(result.gnss_fixed.value().data);
+}
+
+// A fix dropped for lack of the transform has still been observed: it stays in the position
+// buffer, so the average once the transform is available includes it.
+TEST(GnssPoser, Tf_MissingTransform_FixStaysInPositionBuffer)
+{
+  // Arrange
+  std::optional<Transform> available;  // no transform until it is assigned
+  GnssPoser poser(
+    make_buffer_params(1, 2), [&available](const std::string &) { return available; });
+  poser.set_projector_info(make_mgrs_projector_info());
+  const auto fixes = make_average_fixes();
+  input_fixes(poser, {fixes[0], fixes[1]});
+  available = Transform{};
+
+  // Act
+  const auto result = poser.input_fix(fixes[2]);
+
+  // Assert
+  expect_point_near(
+    pose_of(result).position, mean_of({project_mgrs(fixes[1]), project_mgrs(fixes[2])}));
 }
 
 // The base_link pose is the antenna pose composed with the looked-up transform: the antenna
@@ -1303,9 +1318,8 @@ TEST(GnssPoser, Tf_LookedUpTransform_IsComposedWithAntennaPose)
   transform.translation.y = 2.0;
   transform.translation.z = 0.5;
   transform.rotation = yaw_to_quaternion(M_PI / 2.0);
-  GnssPoser poser({}, [transform](const std::string &, const builtin_interfaces::msg::Time &) {
-    return std::optional<Transform>(transform);
-  });
+  GnssPoser poser(
+    {}, [transform](const std::string &) { return std::optional<Transform>(transform); });
   poser.set_projector_info(make_mgrs_projector_info());
   poser.set_ins_orientation(make_orientation(M_PI / 2.0));
   const auto fix = make_reference_fix();
