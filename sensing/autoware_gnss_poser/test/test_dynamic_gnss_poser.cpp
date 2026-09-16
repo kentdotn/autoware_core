@@ -37,8 +37,6 @@ using autoware::gnss_poser::DynamicGnssPoser;
 using autoware::gnss_poser::GnssPosePubMethod;
 using autoware::gnss_poser::GnssPoser;
 using autoware::gnss_poser::GnssPoserParams;
-using autoware::gnss_poser::PendingFixQueue;
-using autoware::gnss_poser::project_to_map;
 using autoware_map_msgs::msg::MapProjectorInfo;
 using geometry_msgs::msg::Transform;
 using sensor_msgs::msg::NavSatFix;
@@ -100,7 +98,7 @@ class Transforms
 public:
   void set(const int32_t sec, const double x) { by_sec_[sec] = make_transform(x); }
 
-  PendingFixQueue::TransformLookup lookup()
+  DynamicGnssPoser::PendingFixes::TransformLookup lookup()
   {
     return [this](
              const std::string & frame,
@@ -121,6 +119,23 @@ private:
   std::map<int32_t, Transform> by_sec_;
 };
 
+// Where a fix lands in the map frame without any lever arm, read back through a poser that is
+// given the identity transform. Used to state the expectations below relative to the antenna
+// position, without projecting anything here.
+double projected_x(const NavSatFix & fix)
+{
+  Transforms identity;
+  identity.set(fix.header.stamp.sec, 0.0);
+  DynamicGnssPoser oracle(make_params(), identity.lookup(), default_timeout_sec);
+  oracle.set_projector_info(make_projector_info());
+  const std::vector<GnssPoser::Result> results = oracle.input_fix(fix);
+  EXPECT_EQ(results.size(), 1U);
+  if (results.empty() || !results[0].gnss_pose) {
+    return 0.0;
+  }
+  return results[0].gnss_pose->pose.position.x;
+}
+
 // The x of the pose of a Published result, relative to the projected antenna position: with an
 // identity antenna orientation that is the translation the transform contributed.
 double lever_arm_x(const GnssPoser::Result & result, const NavSatFix & fix)
@@ -128,7 +143,7 @@ double lever_arm_x(const GnssPoser::Result & result, const NavSatFix & fix)
   EXPECT_EQ(result.outcome, Outcome::Published);
   const auto position =
     result.gnss_pose ? result.gnss_pose->pose.position : geometry_msgs::msg::Point{};
-  return position.x - project_to_map(fix, make_projector_info()).x;
+  return position.x - projected_x(fix);
 }
 }  // namespace
 

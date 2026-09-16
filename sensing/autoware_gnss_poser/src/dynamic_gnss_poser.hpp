@@ -16,7 +16,7 @@
 
 #include "gnss_poser.hpp"
 #include "gnss_poser_interface.hpp"
-#include "pending_fix_queue.hpp"
+#include "pending_message_queue.hpp"
 #include "static_gnss_poser.hpp"
 
 #include <autoware_map_msgs/msg/map_projector_info.hpp>
@@ -44,6 +44,8 @@ namespace autoware::gnss_poser
 class DynamicGnssPoser : public GnssPoserInterface
 {
 public:
+  using PendingFixes = PendingMessageQueue<sensor_msgs::msg::NavSatFix>;
+
   /// \param lookup_antenna_to_base_link resolves the transform for a fix's antenna frame at the
   /// fix's own stamp, or nothing while TF cannot provide it.
   /// \param timeout_sec a queued fix is dropped once a fix newer than it by more than this has
@@ -51,7 +53,7 @@ public:
   /// \throw std::invalid_argument when params.buff_epoch is smaller than 1 or timeout_sec is
   /// negative.
   DynamicGnssPoser(
-    const GnssPoserParams & params, PendingFixQueue::TransformLookup lookup_antenna_to_base_link,
+    const GnssPoserParams & params, PendingFixes::TransformLookup lookup_antenna_to_base_link,
     double timeout_sec, const GnssPoserCovarianceDefaults & covariance_defaults = {});
 
   // Non-copyable and non-movable: the pose computation holds a lookup that reads this object.
@@ -79,7 +81,7 @@ public:
 private:
   std::vector<GnssPoser::Result> drain();
 
-  PendingFixQueue pending_fixes_;
+  PendingFixes pending_fixes_;
   // The transform the queue resolved for the fix being computed. The pose computation reads it
   // through its lookup, so it receives the transform that belongs to that fix rather than
   // whatever TF holds by the time the fix is computed.

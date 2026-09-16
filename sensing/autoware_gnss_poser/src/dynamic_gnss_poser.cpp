@@ -14,6 +14,7 @@
 
 #include "dynamic_gnss_poser.hpp"
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <utility>
@@ -21,10 +22,18 @@
 
 namespace autoware::gnss_poser
 {
+namespace
+{
+// Hard bound on the queue, so that fixes whose stamps do not advance cannot grow it without end.
+// Well above what any GNSS rate produces within the timeout.
+constexpr std::size_t max_pending_fixes = 32;
+}  // namespace
+
 DynamicGnssPoser::DynamicGnssPoser(
-  const GnssPoserParams & params, PendingFixQueue::TransformLookup lookup_antenna_to_base_link,
+  const GnssPoserParams & params, PendingFixes::TransformLookup lookup_antenna_to_base_link,
   const double timeout_sec, const GnssPoserCovarianceDefaults & covariance_defaults)
-: pending_fixes_(std::move(lookup_antenna_to_base_link), timeout_sec),
+: pending_fixes_(
+    std::move(lookup_antenna_to_base_link), PendingFixes::Limits{timeout_sec, max_pending_fixes}),
   gnss_poser_(
     std::make_unique<StaticGnssPoser>(
       params, [this](const std::string &) { return resolved_transform_; }, covariance_defaults))
@@ -56,15 +65,15 @@ std::vector<GnssPoser::Result> DynamicGnssPoser::input_transform_update()
 std::vector<GnssPoser::Result> DynamicGnssPoser::drain()
 {
   std::vector<GnssPoser::Result> results;
-  while (const std::optional<PendingFixQueue::Item> item = pending_fixes_.next()) {
-    last_fix_was_dropped_ = !item->antenna_to_base_link;
+  while (const std::optional<PendingFixes::Item> item = pending_fixes_.next()) {
+    last_fix_was_dropped_ = !item->transform;
     if (last_fix_was_dropped_) {
       // The fix never became computable, so it was never received: it leaves no result behind,
       // and it does not enter the position buffer either. take_status() reports it instead.
       continue;
     }
-    resolved_transform_ = item->antenna_to_base_link;
-    for (GnssPoser::Result & result : gnss_poser_->input_fix(item->fix)) {
+    resolved_transform_ = item->transform;
+    for (GnssPoser::Result & result : gnss_poser_->input_fix(item->message)) {
       results.push_back(std::move(result));
     }
   }

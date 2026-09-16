@@ -12,7 +12,6 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
   src/dynamic_gnss_poser.cpp
   src/gnss_poser.cpp
   src/gnss_poser_diagnostics.cpp
-  src/pending_fix_queue.cpp
   src/static_gnss_poser.cpp
 )
 
@@ -39,13 +38,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_${PROJECT_NAME} ${PROJECT_NAME})
   target_include_directories(test_${PROJECT_NAME} PRIVATE src)
 
-  # The queue that holds fixes until their antenna transform arrives needs no ROS either: it is
-  # given a lookup and measures ages between fix header stamps.
-  ament_add_gtest(test_${PROJECT_NAME}_pending_fix_queue
-    test/test_pending_fix_queue.cpp
+  # The queue that holds messages until their transform arrives needs no ROS either: it is given a
+  # lookup and measures ages between message stamps.
+  ament_add_gtest(test_${PROJECT_NAME}_pending_message_queue
+    test/test_pending_message_queue.cpp
   )
-  target_link_libraries(test_${PROJECT_NAME}_pending_fix_queue ${PROJECT_NAME})
-  target_include_directories(test_${PROJECT_NAME}_pending_fix_queue PRIVATE src)
+  target_link_libraries(test_${PROJECT_NAME}_pending_message_queue ${PROJECT_NAME})
+  target_include_directories(test_${PROJECT_NAME}_pending_message_queue PRIVATE src)
 
   # Same for the pose computation with that queue in front of it.
   ament_add_gtest(test_${PROJECT_NAME}_dynamic
