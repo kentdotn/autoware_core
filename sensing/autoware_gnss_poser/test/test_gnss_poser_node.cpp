@@ -67,7 +67,6 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -718,11 +717,6 @@ class GnssPoserUnknownPubMethod : public GnssPoserNodeIntegration,
 {
 };
 
-class GnssPoserBuffEpochBelowOne : public GnssPoserNodeIntegration,
-                                   public ::testing::WithParamInterface<std::tuple<int, int>>
-{
-};
-
 }  // namespace
 
 // =======================================================================================
@@ -818,28 +812,18 @@ INSTANTIATE_TEST_SUITE_P(
   OutOfRange, GnssPoserUnknownPubMethod, ::testing::Values(-1, 3, 42),
   [](const ::testing::TestParamInfo<int> & info) { return int_param_name(info.param); });
 
-// `buff_epoch` must be at least 1 whatever the method: 0 and negative values make the node fail to
-// start. Before this validation a zero-capacity buffer counted as "full", so the average published
-// NaN coordinates and the median threw inside the callback.
-TEST_P(GnssPoserBuffEpochBelowOne, Construct_BuffEpochBelowOne_FailsToStart)
+// A `buff_epoch` the logic rejects makes the node fail to start. Which values are rejected, for
+// every method, is unit-tested.
+TEST_F(GnssPoserNodeIntegration, Construct_BuffEpochBelowOne_FailsToStart)
 {
   // Arrange
   NodeParams params;
-  params.gnss_pose_pub_method = std::get<0>(GetParam());
-  params.buff_epoch = std::get<1>(GetParam());
+  params.buff_epoch = 0;
 
   // Act & Assert
   EXPECT_THROW(
     std::make_shared<autoware::gnss_poser::GnssPoserNode>(params.to_options()), std::exception);
 }
-
-INSTANTIATE_TEST_SUITE_P(
-  EveryMethod, GnssPoserBuffEpochBelowOne,
-  ::testing::Combine(::testing::Values(0, 1, 2), ::testing::Values(0, -1)),
-  [](const ::testing::TestParamInfo<std::tuple<int, int>> & info) {
-    return "Method" + int_param_name(std::get<0>(info.param)) + "_BuffEpoch" +
-           int_param_name(std::get<1>(info.param));
-  });
 
 // The node has no built-in defaults: the values README.md and the schema document as defaults live
 // in config/gnss_poser.param.yaml, which the launch file loads. That file must keep constructing
