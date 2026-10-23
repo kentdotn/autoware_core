@@ -26,6 +26,7 @@
 
 #include <autoware/geography_utils/height.hpp>
 #include <autoware/geography_utils/projection.hpp>
+#include <builtin_interfaces/msg/time.hpp>
 #include <tf2/LinearMath/Matrix3x3.hpp>
 #include <tf2/LinearMath/Quaternion.hpp>
 
@@ -47,12 +48,15 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 namespace
 {
 using autoware::gnss_poser::GnssPosePubMethod;
 using autoware::gnss_poser::GnssPoser;
+using autoware::gnss_poser::GnssPoserCovarianceDefaults;
 using autoware::gnss_poser::GnssPoserParams;
 using autoware_map_msgs::msg::MapProjectorInfo;
 using autoware_sensing_msgs::msg::GnssInsOrientation;
@@ -496,6 +500,16 @@ struct CovarianceType
 class GnssPoserKnownCovarianceType : public ::testing::TestWithParam<CovarianceType>
 {
 };
+
+// gnss_pose_pub_method and a buff_epoch below one.
+class GnssPoserBuffEpochBelowOne : public ::testing::TestWithParam<std::tuple<int, int>>
+{
+};
+
+std::string int_param_name(int value)
+{
+  return (value < 0 ? "Minus" : "") + std::to_string(std::abs(value));
+}
 }  // namespace
 
 // =======================================================================================
@@ -1155,4 +1169,153 @@ TEST(GnssPoser, Covariance_UnknownType_PositionVariancesAreTen)
       }
     }
   }
+}
+
+// =======================================================================================
+// 6. What only the logic exposes: construction, covariance defaults, the antenna transform lookup
+// =======================================================================================
+
+// The constructor rejects a buffer of less than one position, whatever the method. Before this
+// validation a zero-capacity buffer counted as "full", so the average published NaN coordinates and
+// the median threw inside the callback.
+TEST_P(GnssPoserBuffEpochBelowOne, Construct_BuffEpochBelowOne_Throws)
+{
+  // Arrange
+  const GnssPoserParams params =
+    make_buffer_params(std::get<0>(GetParam()), std::get<1>(GetParam()));
+
+  // Act & Assert
+  EXPECT_THROW(GnssPoser(params, identity_lookup), std::invalid_argument);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  EveryMethod, GnssPoserBuffEpochBelowOne,
+  ::testing::Combine(::testing::Values(0, 1, 2), ::testing::Values(0, -1)),
+  [](const ::testing::TestParamInfo<std::tuple<int, int>> & info) {
+    return "Method" + int_param_name(std::get<0>(info.param)) + "_BuffEpoch" +
+           int_param_name(std::get<1>(info.param));
+  });
+
+// The covariance values claimed when the input carries none are taken from the injected defaults;
+// values other than the shipped ones can only come from there.
+TEST(GnssPoser, Covariance_InjectedDefaults_UnknownPositionVariancesAreUsed)
+{
+  // Arrange
+  GnssPoserCovarianceDefaults defaults;
+  defaults.unknown_position_variances = {7.0, 8.0, 9.0};
+  GnssPoser poser({}, identity_lookup, defaults);
+  poser.set_projector_info(make_mgrs_projector_info());
+
+  // Act
+  const auto result = poser.input_fix(make_fix_with_covariance(NavSatFix::COVARIANCE_TYPE_UNKNOWN));
+
+  // Assert
+  expect_position_variances(covariance_of(result), 7.0, 8.0, 9.0);
+}
+
+TEST(GnssPoser, Covariance_InjectedDefaults_MotionRotationVariancesAreUsed)
+{
+  // Arrange
+  GnssPoserParams params;
+  params.use_gnss_ins_orientation = false;
+  GnssPoserCovarianceDefaults defaults;
+  defaults.motion_rotation_variances = {0.2, 0.3, 0.4};
+  GnssPoser poser(params, identity_lookup, defaults);
+  poser.set_projector_info(make_mgrs_projector_info());
+
+  // Act
+  const auto result = poser.input_fix(make_reference_fix());
+
+  // Assert
+  EXPECT_DOUBLE_EQ(covariance_of(result)[cov_roll_roll], 0.2);
+  EXPECT_DOUBLE_EQ(covariance_of(result)[cov_pitch_pitch], 0.3);
+  EXPECT_DOUBLE_EQ(covariance_of(result)[cov_yaw_yaw], 0.4);
+}
+
+// The placeholder rmse is squared like a real one: 0.5^2 = 0.25.
+TEST(GnssPoser, Covariance_InjectedDefaults_InsPlaceholderRmseIsUsed)
+{
+  // Arrange
+  GnssPoserCovarianceDefaults defaults;
+  defaults.ins_placeholder_rmse = 0.5;
+  GnssPoser poser({}, identity_lookup, defaults);
+  poser.set_projector_info(make_mgrs_projector_info());
+
+  // Act
+  const auto result = poser.input_fix(make_reference_fix());
+
+  // Assert
+  EXPECT_DOUBLE_EQ(covariance_of(result)[cov_roll_roll], 0.25);
+  EXPECT_DOUBLE_EQ(covariance_of(result)[cov_pitch_pitch], 0.25);
+  EXPECT_DOUBLE_EQ(covariance_of(result)[cov_yaw_yaw], 0.25);
+}
+
+// The lookup is asked for the transform of the fix header frame at the fix header stamp.
+TEST(GnssPoser, Tf_Lookup_ReceivesFixFrameAndStamp)
+{
+  // Arrange
+  std::vector<std::pair<std::string, builtin_interfaces::msg::Time>> lookups;
+  GnssPoser poser(
+    {}, [&lookups](const std::string & frame, const builtin_interfaces::msg::Time & stamp) {
+      lookups.emplace_back(frame, stamp);
+      return std::optional<Transform>(Transform{});
+    });
+  poser.set_projector_info(make_mgrs_projector_info());
+  auto fix = make_reference_fix();
+  fix.header.frame_id = "my_antenna";
+  fix.header.stamp.sec = 1234;
+  fix.header.stamp.nanosec = 5678U;
+
+  // Act
+  poser.input_fix(fix);
+
+  // Assert
+  ASSERT_EQ(lookups.size(), 1U);
+  EXPECT_EQ(lookups[0].first, "my_antenna");
+  EXPECT_EQ(lookups[0].second, fix.header.stamp);
+}
+
+// A transform the lookup cannot provide is replaced by the identity: the antenna pose is published
+// as the base_link pose.
+TEST(GnssPoser, Tf_MissingTransform_PublishesAntennaPose)
+{
+  // Arrange
+  GnssPoser poser({}, [](const std::string &, const builtin_interfaces::msg::Time &) {
+    return std::optional<Transform>();
+  });
+  poser.set_projector_info(make_mgrs_projector_info());
+  const auto fix = make_reference_fix();
+
+  // Act
+  const auto result = poser.input_fix(fix);
+
+  // Assert
+  expect_point_near(pose_of(result).position, project_mgrs(fix));
+}
+
+// The base_link pose is the antenna pose composed with the looked-up transform: the antenna
+// orientation (yaw pi/2) rotates the lever arm (1, 2, 0.5) into (-2, 1, 0.5), and the yaws add up.
+TEST(GnssPoser, Tf_LookedUpTransform_IsComposedWithAntennaPose)
+{
+  // Arrange
+  Transform transform;
+  transform.translation.x = 1.0;
+  transform.translation.y = 2.0;
+  transform.translation.z = 0.5;
+  transform.rotation = yaw_to_quaternion(M_PI / 2.0);
+  GnssPoser poser({}, [transform](const std::string &, const builtin_interfaces::msg::Time &) {
+    return std::optional<Transform>(transform);
+  });
+  poser.set_projector_info(make_mgrs_projector_info());
+  poser.set_ins_orientation(make_orientation(M_PI / 2.0));
+  const auto fix = make_reference_fix();
+  const auto antenna = project_mgrs(fix);
+
+  // Act
+  const auto result = poser.input_fix(fix);
+
+  // Assert
+  expect_point_near(
+    pose_of(result).position, make_point(antenna.x - 2.0, antenna.y + 1.0, antenna.z + 0.5));
+  EXPECT_NEAR(std::abs(yaw_of(pose_of(result).orientation)), M_PI, angle_tolerance);
 }
