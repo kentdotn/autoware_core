@@ -10,6 +10,7 @@ find_package(GeographicLib REQUIRED)
 # Logic layer: rclcpp-free helpers of the pose computation.
 ament_auto_add_library(${PROJECT_NAME} SHARED
   src/gnss_poser.cpp
+  src/gnss_poser_diagnostics.cpp
 )
 
 # ROS layer: parameters, pub/sub, TF lookup and broadcast.
@@ -34,6 +35,13 @@ if(BUILD_TESTING)
   )
   target_link_libraries(test_${PROJECT_NAME} ${PROJECT_NAME})
   target_include_directories(test_${PROJECT_NAME} PRIVATE src)
+
+  # The diagnostics decision is a pure function too, so the same plain-gtest treatment applies.
+  ament_add_gtest(test_${PROJECT_NAME}_diagnostics
+    test/test_gnss_poser_diagnostics.cpp
+  )
+  target_link_libraries(test_${PROJECT_NAME}_diagnostics ${PROJECT_NAME})
+  target_include_directories(test_${PROJECT_NAME}_diagnostics PRIVATE src)
 
   # ROS-based tests can be executed only when agnocast is disabled.
   if(NOT (DEFINED ENV{ENABLE_AGNOCAST} AND "$ENV{ENABLE_AGNOCAST}" STREQUAL "1"))
