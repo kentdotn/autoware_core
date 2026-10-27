@@ -1018,33 +1018,27 @@ INSTANTIATE_TEST_SUITE_P(
   });
 
 // With orientation_source motion the heading comes from motion, and only from the last two
-// accepted positions: the first fix has no previous position and gets the identity; every later fix
-// gets yaw = atan2 of its displacement from the previous fix (roll = pitch = 0), whatever the
-// heading before was. The orientation covariance is the constant 0.1 / 0.1 / 1.0 regardless of the
-// displacement, and INS messages are ignored in this mode.
+// accepted positions: the first fix has no previous position, so it has no heading and yields only
+// gnss_fixed; every later fix gets yaw = atan2 of its displacement from the previous fix (roll =
+// pitch = 0), whatever the heading before was. The orientation covariance is the constant 0.1 / 0.1
+// / 1.0 regardless of the displacement, and INS messages are ignored in this mode.
 //
 // NOTE(characterization): standing still gives a zero displacement and atan2(0, 0) = 0, so the
 // heading snaps back to east instead of keeping the last one.
-TEST(GnssPoser, MotionOrientation_FirstFix_IdentityAndConstantCovariance)
+TEST(GnssPoser, MotionOrientation_FirstFix_PublishesOnlyGnssFixed)
 {
   // Arrange
   GnssPoserParams params;
   params.orientation_source = OrientationSource::Motion;
   GnssPoser poser = make_poser_with_mgrs_projector(params);
-  // INS orientation messages are ignored in this mode.
-  poser.set_ins_orientation(make_orientation(M_PI / 2.0, 0.1, 0.2, 0.3));
-  const auto fixes = make_motion_fixes();
 
   // Act
-  // First fix: no previous position => yaw = atan2(0, 0) = 0 (identity).
-  const auto result = poser.input_fix(fixes[0]);
+  const auto result = poser.input_fix(make_reference_fix());
 
   // Assert
-  expect_same_rotation(pose_of(result).orientation, yaw_to_quaternion(0.0));
-  // orientation_source motion always writes the constants 0.1 / 0.1 / 1.0.
-  EXPECT_DOUBLE_EQ(covariance_of(result)[cov_roll_roll], 0.1);
-  EXPECT_DOUBLE_EQ(covariance_of(result)[cov_pitch_pitch], 0.1);
-  EXPECT_DOUBLE_EQ(covariance_of(result)[cov_yaw_yaw], 1.0);
+  EXPECT_EQ(result.outcome, GnssPoser::Outcome::NoOrientation);
+  expect_only_gnss_fixed(result);
+  EXPECT_TRUE(result.gnss_fixed.value().data);
 }
 
 TEST(GnssPoser, MotionOrientation_ThirdFix_YawFromLatestStepOnly)
@@ -1062,7 +1056,7 @@ TEST(GnssPoser, MotionOrientation_ThirdFix_YawFromLatestStepOnly)
   const double yaw_step = std::atan2(p3.y - p2.y, p3.x - p2.x);
   const double yaw_from_start = std::atan2(p3.y - p1.y, p3.x - p1.x);
   ASSERT_GT(std::abs(yaw_step - yaw_from_start), 0.5) << "fixture data must tell the two apart";
-  // First fix: no previous position => yaw = atan2(0, 0) = 0 (identity).
+  // First fix: no previous position => no pose.
   // Second fix: yaw of the displacement in the map frame (roll = pitch = 0).
   input_fixes(poser, {fixes[0], fixes[1]});
 
@@ -1085,7 +1079,7 @@ TEST(GnssPoser, MotionOrientation_StandingStill_YawSnapsToZero)
   // INS orientation messages are ignored in this mode.
   poser.set_ins_orientation(make_orientation(M_PI / 2.0, 0.1, 0.2, 0.3));
   const auto fixes = make_motion_fixes();
-  // First fix: no previous position => yaw = atan2(0, 0) = 0 (identity).
+  // First fix: no previous position => no pose.
   // Second fix: yaw of the displacement in the map frame (roll = pitch = 0).
   // Third fix: the heading follows the latest displacement only. It is atan2(p3 - p2), the heading
   // of the step just made, and not atan2(p3 - p1) or anything carried over from the previous
@@ -1153,7 +1147,8 @@ TEST(GnssPoser, MotionOrientation_WithBuffer_UsesFilteredPositions)
 }
 
 // The motion heading in the four cardinal directions, including the wrap-around at +-pi when
-// moving west: yaw = atan2 of the displacement between the two projected positions.
+// moving west: yaw = atan2 of the displacement between the two projected positions, with the
+// constant orientation covariance.
 TEST_P(GnssPoserMotionHeading, MotionOrientation_CardinalDirection_YawFromDisplacement)
 {
   // Arrange
@@ -1174,6 +1169,10 @@ TEST_P(GnssPoserMotionHeading, MotionOrientation_CardinalDirection_YawFromDispla
 
   // Assert
   expect_same_rotation(pose_of(result).orientation, yaw_to_quaternion(expected_yaw));
+  // orientation_source motion always writes the constants 0.1 / 0.1 / 1.0.
+  EXPECT_DOUBLE_EQ(covariance_of(result)[cov_roll_roll], 0.1);
+  EXPECT_DOUBLE_EQ(covariance_of(result)[cov_pitch_pitch], 0.1);
+  EXPECT_DOUBLE_EQ(covariance_of(result)[cov_yaw_yaw], 1.0);
 }
 
 INSTANTIATE_TEST_SUITE_P(
