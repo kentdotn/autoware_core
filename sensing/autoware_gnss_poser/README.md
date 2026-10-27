@@ -13,6 +13,21 @@ The antenna is rigidly mounted on the vehicle, so this transformation is expecte
 
 If the transformation from `base_link` to the antenna cannot be obtained, the fix is skipped: `gnss_fixed` still reports the receiver's status, but no pose is published. This is expected right after startup, before the transformation has been received, so while it is unavailable (a frame or a link of the chain has not been received yet) the fixes are skipped silently for up to 5 seconds, counted from the first fix that could not get it. The time is measured by the `header.stamp` of the fixes, so it follows the data (e.g. a rosbag replayed at another rate); where the stamps go backward or jump forward by more than 2 seconds, the count starts over, and an error already logged is logged again if the transformation is still missing after another 5 seconds (e.g. in every loop of a rosbag replayed in a loop). After that, at the next fix that gets as far as the transformation (a fix that the receiver reports as not fixed, for example, does not), the node logs an error once, naming both frames, so that a `header.frame_id` that never gets a transformation is visible instead of silently yielding no pose. When TF has the transformations but the lookup still fails, for example because `header.frame_id` is not a frame name TF accepts (empty, or starting with `/`), waiting does not help, so it is logged as an error at once. Each problem is logged once when it arises rather than for every fix.
 
+### Orientation
+
+NavSatFix carries no orientation. `orientation_source` selects where the orientation of the pose comes from:
+
+| Value                      | Orientation                                                                                      | Rotation covariance (roll, pitch, yaw)      |
+| -------------------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------- |
+| `ins`                      | the latest `autoware_orientation`. No pose is published until the first one has arrived.         | its `rmse_rotation_*` squared               |
+| `motion`                   | the heading of the displacement from the previous position to the current one (roll = pitch = 0) | 0.1, 0.1, 1.0 [rad^2]                       |
+| `none`                     | unknown: the identity, that is heading east in the map frame                                     | 1.0, 1.0, 1.0 [rad^2]                       |
+| `ins_or_none` (deprecated) | as `ins` once `autoware_orientation` has arrived, as `none` until then                           | as `ins`, or as `none` before the first one |
+
+`orientation_source` replaces `use_gnss_ins_orientation`, which is deprecated. A configuration that sets only `use_gnss_ins_orientation` still works and gets a warning at startup: `true` is read as `ins_or_none` (what it did) and `false` as `motion`. When both are set, `use_gnss_ins_orientation` is ignored. `ins_or_none` is deprecated as well, because a pose with the stand-in orientation cannot be told apart from one with a measured orientation: use `ins` when `autoware_orientation` is published and `none` otherwise.
+
+The node logs the source in use at startup, and warns once when `autoware_orientation` arrives while the source is `none`, since it is then ignored.
+
 ## Inputs / Outputs
 
 ### Input
@@ -35,13 +50,14 @@ If the transformation from `base_link` to the antenna cannot be obtained, the fi
 
 Parameters in below table
 
-| Name                       | Type      | Default          | Description                                                                                                                          |
-| -------------------------- | --------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `base_frame`               | `string`  | `base_link`      | frame id for base_frame                                                                                                              |
-| `gnss_base_frame`          | `string`  | `gnss_base_link` | frame id for gnss_base_frame                                                                                                         |
-| `map_frame`                | `string`  | `map`            | frame id for map_frame                                                                                                               |
-| `use_gnss_ins_orientation` | `boolean` | `true`           | use Gnss-Ins orientation                                                                                                             |
-| `gnss_pose_pub_method`     | `integer` | `0`              | 0: Instant Value 1: Average Value 2: Median Value. Any other value is rejected at startup.                                           |
-| `buff_epoch`               | `integer` | `1`              | Number of positions the average / median is taken over (ignored for method 0). Range: 1~inf; smaller values are rejected at startup. |
+| Name                       | Type      | Default          | Description                                                                                                                                 |
+| -------------------------- | --------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `base_frame`               | `string`  | `base_link`      | frame id for base_frame                                                                                                                     |
+| `gnss_base_frame`          | `string`  | `gnss_base_link` | frame id for gnss_base_frame                                                                                                                |
+| `map_frame`                | `string`  | `map`            | frame id for map_frame                                                                                                                      |
+| `orientation_source`       | `string`  | `none`           | `ins`, `motion`, `none` or `ins_or_none` (deprecated); see [Orientation](#orientation). Any other value is rejected at startup.             |
+| `use_gnss_ins_orientation` | `boolean` | not set          | Deprecated: set `orientation_source` instead. Read only when `orientation_source` is not set: `true` as `ins_or_none`, `false` as `motion`. |
+| `gnss_pose_pub_method`     | `integer` | `0`              | 0: Instant Value 1: Average Value 2: Median Value. Any other value is rejected at startup.                                                  |
+| `buff_epoch`               | `integer` | `1`              | Number of positions the average / median is taken over (ignored for method 0). Range: 1~inf; smaller values are rejected at startup.        |
 
 All above parameters can be changed in config file [gnss_poser.param.yaml](./config/gnss_poser.param.yaml "Click here to open config file") .
