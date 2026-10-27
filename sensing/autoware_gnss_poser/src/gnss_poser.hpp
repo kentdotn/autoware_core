@@ -41,12 +41,22 @@ namespace autoware::gnss_poser
 // average / component-wise median of the last `buff_epoch` ones.
 enum class GnssPosePubMethod { Instant = 0, Average = 1, Median = 2 };
 
+/// \brief Where the orientation of the published pose comes from.
+enum class OrientationSource {
+  Ins,     ///< the latest INS orientation; no pose until the first one has arrived
+  Motion,  ///< the heading of the displacement between consecutive positions
+  None,    ///< unknown: the identity (heading east) with the placeholder rmse
+  /// The INS orientation once one has arrived, the identity with the placeholder rmse until then.
+  /// What use_gnss_ins_orientation = true did; deprecated.
+  InsOrNone,
+};
+
 /// \brief Configuration of GnssPoser, taken from the node parameters of the same names.
 struct GnssPoserParams
 {
   GnssPosePubMethod gnss_pose_pub_method = GnssPosePubMethod::Instant;
   int buff_epoch = 1;
-  bool use_gnss_ins_orientation = true;
+  OrientationSource orientation_source = OrientationSource::None;
   /// frame_id of the published pose and of the transform to broadcast.
   std::string map_frame = "map";
   /// child_frame_id of the transform to broadcast.
@@ -73,8 +83,9 @@ struct GnssPoserCovarianceDefaults
   std::array<double, 3> unknown_position_variances = default_unknown_position_variances;
   /// Roll, pitch and yaw variances used while the orientation is derived from motion. [rad^2]
   std::array<double, 3> motion_rotation_variances = default_motion_rotation_variances;
-  /// Stand-in rmse per axis until the first INS orientation arrives. It is squared into the
-  /// rotation variances like a real one, so 1.0 rad becomes 1.0 rad^2. [rad]
+  /// Rmse per axis claimed for the identity orientation that stands for an unknown one
+  /// (OrientationSource::None, and InsOrNone before the first INS orientation). It is squared into
+  /// the rotation variances like a real one, so 1.0 rad becomes 1.0 rad^2. [rad]
   double ins_placeholder_rmse = default_ins_placeholder_rmse;
 };
 
@@ -111,6 +122,7 @@ public:
     LocalProjector,   ///< the map uses a local projector, so a GNSS fix cannot be converted
     NotFixed,         ///< the receiver reports no fix; its status is known but no pose is computed
     Buffering,        ///< the position buffer is not full yet (average and median methods)
+    NoOrientation,    ///< orientation_source is ins and no INS orientation has arrived yet
     NoAntennaTransform,  ///< the antenna frame of the fix cannot be transformed to base_link
     Published,           ///< a pose was computed, see Result::gnss_pose
   };
@@ -137,8 +149,7 @@ public:
 
   void set_projector_info(const autoware_map_msgs::msg::MapProjectorInfo & projector_info);
 
-  /// \brief Latch the INS orientation used while use_gnss_ins_orientation is true. Until the first
-  /// call, an identity orientation with an rmse of 1.0 rad per axis stands in for it.
+  /// \brief Latch the INS orientation, used when orientation_source is ins or ins_or_none.
   void set_ins_orientation(const autoware_sensing_msgs::msg::GnssInsOrientation & orientation);
 
   /// \brief Process one fix: gate, project, buffer, orient, compose with the antenna transform and
@@ -157,6 +168,7 @@ private:
   geometry_msgs::msg::Point prev_position_;
   bool has_prev_position_ = false;
   autoware_sensing_msgs::msg::GnssInsOrientation ins_orientation_;
+  bool received_ins_orientation_ = false;
 };
 
 /// \brief Why the antenna transform of a fix could not be looked up.

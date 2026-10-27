@@ -58,6 +58,7 @@ using autoware::gnss_poser::AntennaTransformFailureFilter;
 using autoware::gnss_poser::GnssPosePubMethod;
 using autoware::gnss_poser::GnssPoser;
 using autoware::gnss_poser::GnssPoserParams;
+using autoware::gnss_poser::OrientationSource;
 using autoware_map_msgs::msg::MapProjectorInfo;
 using autoware_sensing_msgs::msg::GnssInsOrientation;
 using geometry_msgs::msg::Point;
@@ -490,6 +491,30 @@ class GnssPoserMotionHeading : public ::testing::TestWithParam<Heading>
 {
 };
 
+// An orientation source that uses the INS orientation once one has arrived.
+struct InsSource
+{
+  const char * name;
+  OrientationSource source;
+};
+
+class GnssPoserInsSource : public ::testing::TestWithParam<InsSource>
+{
+};
+
+// An orientation source, and whether an INS orientation has arrived, that leave the orientation
+// unknown.
+struct UnknownOrientation
+{
+  const char * name;
+  OrientationSource source;
+  bool ins_orientation_arrived;
+};
+
+class GnssPoserUnknownOrientation : public ::testing::TestWithParam<UnknownOrientation>
+{
+};
+
 struct CovarianceType
 {
   const char * name;
@@ -901,13 +926,16 @@ TEST(GnssPoser, Buffer_FirstFixAfterGatedFixes_FillsOnlyOneSlot)
 // 4. Orientation
 // =======================================================================================
 
-// With use_gnss_ins_orientation = true the pose carries the orientation of the latest
-// `autoware_orientation` message, and the orientation covariance diagonal is its RMSE squared
-// (float32 precision). A newer message replaces the previous one; its header is irrelevant.
-TEST(GnssPoser, InsOrientation_NewerMessage_ReplacesPrevious)
+// With orientation_source ins, and ins_or_none once a message has arrived, the pose carries the
+// orientation of the latest `autoware_orientation` message, and the orientation covariance
+// diagonal is its RMSE squared (float32 precision). A newer message replaces the previous one; its
+// header is irrelevant.
+TEST_P(GnssPoserInsSource, InsOrientation_NewerMessage_ReplacesPrevious)
 {
   // Arrange
-  GnssPoser poser = make_poser_with_mgrs_projector({});
+  GnssPoserParams params;
+  params.orientation_source = GetParam().source;
+  GnssPoser poser = make_poser_with_mgrs_projector(params);
   poser.set_ins_orientation(make_orientation(M_PI / 2.0, 0.1, 0.2, 0.3));
   input_fixes(poser, {make_reference_fix()});
   // A newer orientation message replaces the previous one; its header is irrelevant.
@@ -922,23 +950,45 @@ TEST(GnssPoser, InsOrientation_NewerMessage_ReplacesPrevious)
   expect_rotation_variances_near(covariance_of(result), 0.25, 0.36, 0.49);
 }
 
-// With use_gnss_ins_orientation = true the node does not wait for an orientation message: before
-// the first one it publishes the message-default orientation (identity, i.e. heading east in `map`)
-// with the constructor's placeholder RMSE of 1.0 squared, and the antenna position unchanged.
-//
-// NOTE(characterization): a consumer cannot tell this placeholder from a measured orientation whose
-// RMSE happens to be 1.0, and the identity heading also enters the antenna -> base_link lever-arm
-// correction. Whether to gate on the first orientation (as on projector info) is a decision for the
-// refactoring phase, not for this test.
-TEST(GnssPoser, InsOrientation_NoMessageYet_IdentityAndUnitCovariance)
+INSTANTIATE_TEST_SUITE_P(
+  InsAndInsOrNone, GnssPoserInsSource,
+  ::testing::Values(
+    InsSource{"Ins", OrientationSource::Ins}, InsSource{"InsOrNone", OrientationSource::InsOrNone}),
+  [](const ::testing::TestParamInfo<InsSource> & info) { return std::string(info.param.name); });
+
+// With orientation_source ins the pose waits for the INS orientation: before the first message a
+// fix yields only gnss_fixed, instead of a pose with an orientation nobody measured.
+TEST(GnssPoser, InsOrientation_NoMessageYet_PublishesOnlyGnssFixed)
+{
+  // Arrange
+  GnssPoserParams params;
+  params.orientation_source = OrientationSource::Ins;
+  GnssPoser poser = make_poser_with_mgrs_projector(params);
+
+  // Act
+  const auto result = poser.input_fix(make_reference_fix());
+
+  // Assert
+  EXPECT_EQ(result.outcome, GnssPoser::Outcome::NoOrientation);
+  expect_only_gnss_fixed(result);
+  EXPECT_TRUE(result.gnss_fixed.value().data);
+}
+
+// The orientation is unknown with orientation_source none, which ignores the INS orientation, and
+// with ins_or_none before the first one. The pose then carries the identity orientation (heading
+// east in `map`) with the placeholder RMSE of 1.0 squared, and the antenna position unchanged.
+TEST_P(GnssPoserUnknownOrientation, UnknownOrientation_IdentityAndUnitCovariance)
 {
   // Arrange
   GnssPoserParams params;
   params.gnss_pose_pub_method = GnssPosePubMethod::Instant;
-  params.use_gnss_ins_orientation = true;
+  params.orientation_source = GetParam().source;
   GnssPoser poser(params, identity_lookup);
   const auto projector = make_mgrs_projector_info();
   poser.set_projector_info(projector);
+  if (GetParam().ins_orientation_arrived) {
+    poser.set_ins_orientation(make_orientation(M_PI / 2.0, 0.1, 0.2, 0.3));
+  }
 
   const auto fix = make_reference_fix();
   const auto expected_antenna = project_antenna(fix, projector);
@@ -950,7 +1000,7 @@ TEST(GnssPoser, InsOrientation_NoMessageYet_IdentityAndUnitCovariance)
   EXPECT_TRUE(result.gnss_fixed.value().data);
   expect_point_near(pose_of(result).position, expected_antenna);
   expect_same_rotation(pose_of(result).orientation, yaw_to_quaternion(0.0));
-  // 1.0 comes from the constructor's placeholder rmse and is squared: 1.0^2 = 1.0.
+  // 1.0 comes from the placeholder rmse and is squared: 1.0^2 = 1.0.
   EXPECT_DOUBLE_EQ(covariance_of(result)[cov_roll_roll], 1.0);
   EXPECT_DOUBLE_EQ(covariance_of(result)[cov_pitch_pitch], 1.0);
   EXPECT_DOUBLE_EQ(covariance_of(result)[cov_yaw_yaw], 1.0);
@@ -958,7 +1008,16 @@ TEST(GnssPoser, InsOrientation_NoMessageYet_IdentityAndUnitCovariance)
   EXPECT_DOUBLE_EQ(covariance_of(result)[cov_xx], 1.0);
 }
 
-// With use_gnss_ins_orientation = false the heading comes from motion, and only from the last two
+INSTANTIATE_TEST_SUITE_P(
+  NoneAndInsOrNone, GnssPoserUnknownOrientation,
+  ::testing::Values(
+    UnknownOrientation{"None_InsOrientationArrived", OrientationSource::None, true},
+    UnknownOrientation{"InsOrNone_NoInsOrientationYet", OrientationSource::InsOrNone, false}),
+  [](const ::testing::TestParamInfo<UnknownOrientation> & info) {
+    return std::string(info.param.name);
+  });
+
+// With orientation_source motion the heading comes from motion, and only from the last two
 // accepted positions: the first fix has no previous position and gets the identity; every later fix
 // gets yaw = atan2 of its displacement from the previous fix (roll = pitch = 0), whatever the
 // heading before was. The orientation covariance is the constant 0.1 / 0.1 / 1.0 regardless of the
@@ -970,7 +1029,7 @@ TEST(GnssPoser, MotionOrientation_FirstFix_IdentityAndConstantCovariance)
 {
   // Arrange
   GnssPoserParams params;
-  params.use_gnss_ins_orientation = false;
+  params.orientation_source = OrientationSource::Motion;
   GnssPoser poser = make_poser_with_mgrs_projector(params);
   // INS orientation messages are ignored in this mode.
   poser.set_ins_orientation(make_orientation(M_PI / 2.0, 0.1, 0.2, 0.3));
@@ -982,7 +1041,7 @@ TEST(GnssPoser, MotionOrientation_FirstFix_IdentityAndConstantCovariance)
 
   // Assert
   expect_same_rotation(pose_of(result).orientation, yaw_to_quaternion(0.0));
-  // use_gnss_ins_orientation = false always writes the constants 0.1 / 0.1 / 1.0.
+  // orientation_source motion always writes the constants 0.1 / 0.1 / 1.0.
   EXPECT_DOUBLE_EQ(covariance_of(result)[cov_roll_roll], 0.1);
   EXPECT_DOUBLE_EQ(covariance_of(result)[cov_pitch_pitch], 0.1);
   EXPECT_DOUBLE_EQ(covariance_of(result)[cov_yaw_yaw], 1.0);
@@ -992,7 +1051,7 @@ TEST(GnssPoser, MotionOrientation_ThirdFix_YawFromLatestStepOnly)
 {
   // Arrange
   GnssPoserParams params;
-  params.use_gnss_ins_orientation = false;
+  params.orientation_source = OrientationSource::Motion;
   GnssPoser poser = make_poser_with_mgrs_projector(params);
   // INS orientation messages are ignored in this mode.
   poser.set_ins_orientation(make_orientation(M_PI / 2.0, 0.1, 0.2, 0.3));
@@ -1021,7 +1080,7 @@ TEST(GnssPoser, MotionOrientation_StandingStill_YawSnapsToZero)
 {
   // Arrange
   GnssPoserParams params;
-  params.use_gnss_ins_orientation = false;
+  params.orientation_source = OrientationSource::Motion;
   GnssPoser poser = make_poser_with_mgrs_projector(params);
   // INS orientation messages are ignored in this mode.
   poser.set_ins_orientation(make_orientation(M_PI / 2.0, 0.1, 0.2, 0.3));
@@ -1048,7 +1107,7 @@ TEST(GnssPoser, MotionOrientation_PreviousPositionSurvivesNonFixedMessages)
   // Arrange
   GnssPoserParams params;
   params.gnss_pose_pub_method = GnssPosePubMethod::Instant;
-  params.use_gnss_ins_orientation = false;
+  params.orientation_source = OrientationSource::Motion;
   GnssPoser poser(params, identity_lookup);
   const auto projector = make_mgrs_projector_info();
   poser.set_projector_info(projector);
@@ -1077,7 +1136,7 @@ TEST(GnssPoser, MotionOrientation_WithBuffer_UsesFilteredPositions)
 {
   // Arrange
   GnssPoserParams params = make_buffer_params(1, 2);
-  params.use_gnss_ins_orientation = false;
+  params.orientation_source = OrientationSource::Motion;
   GnssPoser poser = make_poser_with_mgrs_projector(params);
   const auto fixes = make_buffered_motion_fixes();
   const auto m12 = mean_of({project_mgrs(fixes[0]), project_mgrs(fixes[1])});
@@ -1099,7 +1158,7 @@ TEST_P(GnssPoserMotionHeading, MotionOrientation_CardinalDirection_YawFromDispla
 {
   // Arrange
   GnssPoserParams params;
-  params.use_gnss_ins_orientation = false;
+  params.orientation_source = OrientationSource::Motion;
   GnssPoser poser = make_poser_with_mgrs_projector(params);
   const auto from = make_reference_fix();
   const auto to = make_fix(
@@ -1130,12 +1189,11 @@ INSTANTIATE_TEST_SUITE_P(
 
 // The position covariance diagonal is copied from the fix for APPROXIMATED, DIAGONAL_KNOWN and
 // KNOWN, and replaced by 10.0 for UNKNOWN; off-diagonal input entries are never propagated and
-// every off-diagonal output entry stays 0. The orientation covariance is the INS RMSE squared.
+// every off-diagonal output entry stays 0.
 TEST_P(GnssPoserKnownCovarianceType, Covariance_KnownType_CopiesDiagonalFromFix)
 {
   // Arrange
   GnssPoser poser = make_poser_with_mgrs_projector({});
-  poser.set_ins_orientation(make_orientation(0.0, 0.1, 0.2, 0.3));
 
   // Act
   const auto result = poser.input_fix(make_fix_with_covariance(GetParam().type));
@@ -1158,7 +1216,6 @@ TEST(GnssPoser, Covariance_UnknownType_PositionVariancesAreTen)
 {
   // Arrange
   GnssPoser poser = make_poser_with_mgrs_projector({});
-  poser.set_ins_orientation(make_orientation(0.0, 0.1, 0.2, 0.3));
 
   // Act
   const auto result = poser.input_fix(make_fix_with_covariance(NavSatFix::COVARIANCE_TYPE_UNKNOWN));
@@ -1169,7 +1226,6 @@ TEST(GnssPoser, Covariance_UnknownType_PositionVariancesAreTen)
     // 10.0 is hard-coded in the node:
     // https://github.com/autowarefoundation/autoware_core/blob/904b5901488f24e13ae5c3add950b2b9985e1407/sensing/autoware_gnss_poser/src/gnss_poser_node.cpp#L192-L197
     expect_position_variances(cov, 10.0, 10.0, 10.0);
-    expect_rotation_variances_near(cov, 0.01, 0.04, 0.09);
     // Everything off the diagonal is zero.
     for (std::size_t i = 0; i < cov.size(); ++i) {
       if (i % 7 != 0) {

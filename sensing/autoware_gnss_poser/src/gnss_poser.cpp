@@ -29,6 +29,7 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -185,6 +186,14 @@ geometry_msgs::msg::Point get_average_position(
   return average_point;
 }
 
+std::array<double, 3> squared_rmse(
+  const autoware_sensing_msgs::msg::GnssInsOrientation & orientation)
+{
+  return {
+    std::pow(orientation.rmse_rotation_x, 2), std::pow(orientation.rmse_rotation_y, 2),
+    std::pow(orientation.rmse_rotation_z, 2)};
+}
+
 geometry_msgs::msg::Quaternion get_quaternion_by_position_difference(
   const geometry_msgs::msg::Point & point, const geometry_msgs::msg::Point & prev_point)
 {
@@ -207,12 +216,6 @@ GnssPoser::GnssPoser(
       "buff_epoch must be at least 1, got " + std::to_string(params.buff_epoch));
   }
   position_buffer_.set_capacity(params.buff_epoch);
-
-  // Stand-in until the first INS message arrives (not to publish zero value covariances).
-  const auto placeholder_rmse = static_cast<float>(covariance_defaults_.ins_placeholder_rmse);
-  ins_orientation_.rmse_rotation_x = placeholder_rmse;
-  ins_orientation_.rmse_rotation_y = placeholder_rmse;
-  ins_orientation_.rmse_rotation_z = placeholder_rmse;
 }
 
 void GnssPoser::set_projector_info(const autoware_map_msgs::msg::MapProjectorInfo & projector_info)
@@ -225,6 +228,7 @@ void GnssPoser::set_ins_orientation(
   const autoware_sensing_msgs::msg::GnssInsOrientation & orientation)
 {
   ins_orientation_ = orientation;
+  received_ins_orientation_ = true;
 }
 
 GnssPoser::Result GnssPoser::input_fix(const sensor_msgs::msg::NavSatFix & fix)
@@ -267,17 +271,43 @@ GnssPoser::Result GnssPoser::input_fix(const sensor_msgs::msg::NavSatFix & fix)
                                    : get_median_position(position_buffer_);
   }
 
-  // calc gnss antenna orientation
+  // calc gnss antenna orientation and its roll, pitch and yaw variances. An unknown orientation is
+  // the identity (heading east) with the placeholder rmse, so that its variances are not zero.
   geometry_msgs::msg::Quaternion orientation;
-  if (params_.use_gnss_ins_orientation) {
-    orientation = ins_orientation_.orientation;
-  } else {
-    if (!has_prev_position_) {
+  const double placeholder_variance = std::pow(covariance_defaults_.ins_placeholder_rmse, 2);
+  std::array<double, 3> rotation_variances = {
+    placeholder_variance, placeholder_variance, placeholder_variance};
+  switch (params_.orientation_source) {
+    case OrientationSource::Ins:
+      if (!received_ins_orientation_) {
+        return {
+          Outcome::NoOrientation, make_gnss_fixed(fix.header.stamp, true), std::nullopt,
+          std::nullopt, std::nullopt};
+      }
+      orientation = ins_orientation_.orientation;
+      rotation_variances = squared_rmse(ins_orientation_);
+      break;
+
+    case OrientationSource::InsOrNone:
+      if (received_ins_orientation_) {
+        orientation = ins_orientation_.orientation;
+        rotation_variances = squared_rmse(ins_orientation_);
+      }
+      break;
+
+    case OrientationSource::None:
+      break;
+
+    case OrientationSource::Motion:
+      if (!has_prev_position_) {
+        prev_position_ = gnss_antenna_pose.position;
+        has_prev_position_ = true;
+      }
+      orientation =
+        get_quaternion_by_position_difference(gnss_antenna_pose.position, prev_position_);
       prev_position_ = gnss_antenna_pose.position;
-      has_prev_position_ = true;
-    }
-    orientation = get_quaternion_by_position_difference(gnss_antenna_pose.position, prev_position_);
-    prev_position_ = gnss_antenna_pose.position;
+      rotation_variances = covariance_defaults_.motion_rotation_variances;
+      break;
   }
 
   gnss_antenna_pose.orientation = orientation;
@@ -292,15 +322,6 @@ GnssPoser::Result GnssPoser::input_fix(const sensor_msgs::msg::NavSatFix & fix)
     return {
       Outcome::NoAntennaTransform, make_gnss_fixed(fix.header.stamp, true), std::nullopt,
       std::nullopt, std::nullopt};
-  }
-
-  std::array<double, 3> rotation_variances{};
-  if (params_.use_gnss_ins_orientation) {
-    rotation_variances[0] = std::pow(ins_orientation_.rmse_rotation_x, 2);
-    rotation_variances[1] = std::pow(ins_orientation_.rmse_rotation_y, 2);
-    rotation_variances[2] = std::pow(ins_orientation_.rmse_rotation_z, 2);
-  } else {
-    rotation_variances = covariance_defaults_.motion_rotation_variances;
   }
 
   geometry_msgs::msg::PoseWithCovariance gnss_base_pose_with_covariance;

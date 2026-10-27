@@ -53,9 +53,9 @@ param_files:
     default: config/gnss_poser.param.yaml
 
 param_values:
-  - name: use_gnss_ins_orientation
-    type: bool
-    default: true
+  - name: orientation_source
+    type: string
+    default: none
 
 # processes
 processes:

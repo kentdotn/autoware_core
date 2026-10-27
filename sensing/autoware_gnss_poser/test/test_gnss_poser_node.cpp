@@ -124,16 +124,18 @@ struct NodeParams
   std::string base_frame = "base_link";
   std::string gnss_base_frame = "gnss_base_link";
   std::string map_frame = "map";
-  bool use_gnss_ins_orientation = true;
+  std::optional<std::string> orientation_source = "none";
+  // Deprecated, so left out unless a case sets it.
+  std::optional<bool> use_gnss_ins_orientation;
   int gnss_pose_pub_method = 0;
   int buff_epoch = 1;
 
-  // The six parameters the node declares, in declaration order.
+  // The six parameters the node requires, in declaration order.
   static const std::vector<std::string> & names()
   {
     static const std::vector<std::string> parameter_names = {
-      "base_frame",           "gnss_base_frame", "map_frame", "use_gnss_ins_orientation",
-      "gnss_pose_pub_method", "buff_epoch"};
+      "base_frame",         "gnss_base_frame",      "map_frame",
+      "orientation_source", "gnss_pose_pub_method", "buff_epoch"};
     return parameter_names;
   }
 
@@ -149,7 +151,12 @@ struct NodeParams
     add("base_frame", base_frame);
     add("gnss_base_frame", gnss_base_frame);
     add("map_frame", map_frame);
-    add("use_gnss_ins_orientation", use_gnss_ins_orientation);
+    if (orientation_source) {
+      add("orientation_source", *orientation_source);
+    }
+    if (use_gnss_ins_orientation) {
+      add("use_gnss_ins_orientation", *use_gnss_ins_orientation);
+    }
     add("gnss_pose_pub_method", gnss_pose_pub_method);
     add("buff_epoch", buff_epoch);
     return options;
@@ -633,7 +640,7 @@ protected:
   {
     NodeParams params;
     params.gnss_pose_pub_method = 0;
-    params.use_gnss_ins_orientation = true;
+    params.orientation_source = "ins";
     params.base_frame = "my_base";
     ASSERT_NO_FATAL_FAILURE(build_node_with_mgrs_projector(params));
     send_orientation(make_orientation(M_PI / 2.0));
@@ -647,7 +654,7 @@ protected:
   {
     NodeParams params;
     params.gnss_pose_pub_method = 0;
-    params.use_gnss_ins_orientation = true;
+    params.orientation_source = "ins";
     params.base_frame = "my_base";
     ASSERT_NO_FATAL_FAILURE(build_node_with_mgrs_projector(params));
     send_orientation(make_orientation(0.0));
@@ -731,14 +738,44 @@ class GnssPoserBuffEpochBelowOne : public GnssPoserNodeIntegration,
 {
 };
 
+// Where the orientation of a published pose came from, in the scenario of
+// Construct_OrientationSourceParameters_*.
+enum class PoseYaw { Identity, Ins, Motion };
+
+// orientation_source and use_gnss_ins_orientation as given (std::nullopt: not set), and the
+// orientations of the poses the node publishes.
+struct OrientationSourceParameters
+{
+  const char * name;
+  std::optional<std::string> orientation_source;
+  std::optional<bool> use_gnss_ins_orientation;
+  std::vector<PoseYaw> pose_yaws;
+};
+
+std::ostream & operator<<(std::ostream & os, const OrientationSourceParameters & parameters)
+{
+  return os << parameters.name;
+}
+
+class GnssPoserOrientationSourceParameters
+: public GnssPoserNodeIntegration,
+  public ::testing::WithParamInterface<OrientationSourceParameters>
+{
+};
+
+class GnssPoserUnknownOrientationSource : public GnssPoserNodeIntegration,
+                                          public ::testing::WithParamInterface<std::string>
+{
+};
+
 }  // namespace
 
 // =======================================================================================
 // 1. Construction and ROS interface
 // =======================================================================================
 
-// The node is named `gnss_poser` in the root namespace and declares the six parameters the README
-// documents; every override is read back unchanged.
+// The node is named `gnss_poser` in the root namespace and declares the six parameters it
+// requires; every override is read back unchanged.
 TEST_F(GnssPoserNodeIntegration, Construct_WithAllParameters_DeclaresThemAndIsNamedGnssPoser)
 {
   // Arrange
@@ -746,7 +783,7 @@ TEST_F(GnssPoserNodeIntegration, Construct_WithAllParameters_DeclaresThemAndIsNa
   params.base_frame = "my_base";
   params.gnss_base_frame = "my_gnss_base";
   params.map_frame = "my_map";
-  params.use_gnss_ins_orientation = false;
+  params.orientation_source = "motion";
   params.gnss_pose_pub_method = 2;
   params.buff_epoch = 7;
 
@@ -760,7 +797,7 @@ TEST_F(GnssPoserNodeIntegration, Construct_WithAllParameters_DeclaresThemAndIsNa
   EXPECT_EQ(node_->get_parameter("base_frame").as_string(), "my_base");
   EXPECT_EQ(node_->get_parameter("gnss_base_frame").as_string(), "my_gnss_base");
   EXPECT_EQ(node_->get_parameter("map_frame").as_string(), "my_map");
-  EXPECT_EQ(node_->get_parameter("use_gnss_ins_orientation").as_bool(), false);
+  EXPECT_EQ(node_->get_parameter("orientation_source").as_string(), "motion");
   EXPECT_EQ(node_->get_parameter("gnss_pose_pub_method").as_int(), 2);
   EXPECT_EQ(node_->get_parameter("buff_epoch").as_int(), 7);
 }
@@ -802,6 +839,7 @@ INSTANTIATE_TEST_SUITE_P(
     WrongTypedParameter{"base_frame", rclcpp::ParameterValue(123)},
     WrongTypedParameter{"gnss_base_frame", rclcpp::ParameterValue(123)},
     WrongTypedParameter{"map_frame", rclcpp::ParameterValue(123)},
+    WrongTypedParameter{"orientation_source", rclcpp::ParameterValue(123)},
     WrongTypedParameter{"use_gnss_ins_orientation", rclcpp::ParameterValue("not_a_bool")},
     WrongTypedParameter{"gnss_pose_pub_method", rclcpp::ParameterValue("not_an_int")},
     WrongTypedParameter{"buff_epoch", rclcpp::ParameterValue("not_an_int")}),
@@ -849,6 +887,94 @@ INSTANTIATE_TEST_SUITE_P(
            int_param_name(std::get<1>(info.param));
   });
 
+// orientation_source replaces use_gnss_ins_orientation, and either one is enough: the old one is
+// read as ins_or_none (true) or motion (false), and ignored when orientation_source is set. The
+// source in use shows in the poses of one scenario: a fix, then the INS orientation (yaw pi/4),
+// then a fix north of the first. ins publishes only the second pose, with the INS yaw; ins_or_none
+// the identity, then the INS yaw; none the identity twice; motion the identity, then the heading
+// of the step (north, turned by the MGRS grid convergence).
+TEST_P(GnssPoserOrientationSourceParameters, Construct_OrientationSourceParameters_SelectsTheSource)
+{
+  // Arrange
+  NodeParams params;
+  params.orientation_source = GetParam().orientation_source;
+  params.use_gnss_ins_orientation = GetParam().use_gnss_ins_orientation;
+  const NavSatFix first_fix = make_reference_fix();
+  const NavSatFix second_fix =
+    make_fix(reference_latitude + 0.001, reference_longitude, reference_altitude);
+  constexpr double ins_yaw = M_PI / 4;
+  ASSERT_NO_FATAL_FAILURE(build_node_with_mgrs_projector(params));
+  ASSERT_NO_FATAL_FAILURE(send_fixes_and_wait({first_fix}));
+  send_orientation(make_orientation(ins_yaw));
+
+  // Act
+  ASSERT_NO_FATAL_FAILURE(send_fixes_and_wait({second_fix}));
+
+  // Assert
+  const Point first = project_mgrs(first_fix);
+  const Point second = project_mgrs(second_fix);
+  const double motion_yaw = std::atan2(second.y - first.y, second.x - first.x);
+  const std::vector<PoseYaw> & pose_yaws = GetParam().pose_yaws;
+  ASSERT_EQ(peer_->poses.size(), pose_yaws.size());
+  for (std::size_t i = 0; i < pose_yaws.size(); ++i) {
+    double expected = 0.0;
+    switch (pose_yaws[i]) {
+      case PoseYaw::Identity:
+        expected = 0.0;
+        break;
+
+      case PoseYaw::Ins:
+        expected = ins_yaw;
+        break;
+
+      case PoseYaw::Motion:
+        expected = motion_yaw;
+        break;
+    }
+    EXPECT_NEAR(yaw_of(peer_->poses[i].pose.orientation), expected, angle_tolerance)
+      << "pose " << i;
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  EveryWayToSetIt, GnssPoserOrientationSourceParameters,
+  ::testing::Values(
+    OrientationSourceParameters{"Ins", "ins", std::nullopt, {PoseYaw::Ins}},
+    OrientationSourceParameters{
+      "Motion", "motion", std::nullopt, {PoseYaw::Identity, PoseYaw::Motion}},
+    OrientationSourceParameters{
+      "None", "none", std::nullopt, {PoseYaw::Identity, PoseYaw::Identity}},
+    OrientationSourceParameters{
+      "InsOrNone", "ins_or_none", std::nullopt, {PoseYaw::Identity, PoseYaw::Ins}},
+    OrientationSourceParameters{
+      "LegacyTrue", std::nullopt, true, {PoseYaw::Identity, PoseYaw::Ins}},
+    OrientationSourceParameters{
+      "LegacyFalse", std::nullopt, false, {PoseYaw::Identity, PoseYaw::Motion}},
+    OrientationSourceParameters{
+      "BothSet_OrientationSourceWins", "none", true, {PoseYaw::Identity, PoseYaw::Identity}}),
+  [](const ::testing::TestParamInfo<OrientationSourceParameters> & info) {
+    return std::string(info.param.name);
+  });
+
+// orientation_source accepts exactly ins, motion, none and ins_or_none, in lower case. Any other
+// value makes the node fail to start.
+TEST_P(GnssPoserUnknownOrientationSource, Construct_UnknownOrientationSource_FailsToStart)
+{
+  // Arrange
+  NodeParams params;
+  params.orientation_source = GetParam();
+
+  // Act & Assert
+  EXPECT_THROW(
+    std::make_shared<autoware::gnss_poser::GnssPoserNode>(params.to_options()), std::exception);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  NotAValue, GnssPoserUnknownOrientationSource, ::testing::Values("Ins", "gyro", ""),
+  [](const ::testing::TestParamInfo<std::string> & info) {
+    return info.param.empty() ? std::string("Empty") : info.param;
+  });
+
 // The node has no built-in defaults: the values README.md and the schema document as defaults live
 // in config/gnss_poser.param.yaml, which the launch file loads. That file must keep constructing
 // the node and read back exactly as documented.
@@ -866,7 +992,11 @@ TEST_F(GnssPoserNodeIntegration, Construct_WithShippedParamFile_MatchesDocumente
   EXPECT_EQ(node->get_parameter("base_frame").as_string(), "base_link");
   EXPECT_EQ(node->get_parameter("gnss_base_frame").as_string(), "gnss_base_link");
   EXPECT_EQ(node->get_parameter("map_frame").as_string(), "map");
-  EXPECT_TRUE(node->get_parameter("use_gnss_ins_orientation").as_bool());
+  EXPECT_EQ(node->get_parameter("orientation_source").as_string(), "none");
+  // The deprecated parameter is left out.
+  EXPECT_EQ(
+    node->get_parameter("use_gnss_ins_orientation").get_type(),
+    rclcpp::ParameterType::PARAMETER_NOT_SET);
   EXPECT_EQ(node->get_parameter("gnss_pose_pub_method").as_int(), 0);
   EXPECT_EQ(node->get_parameter("buff_epoch").as_int(), 1);
 }
@@ -979,7 +1109,7 @@ TEST_F(GnssPoserNodeIntegration, Tf_StaticAntennaToBaseTransform_IsComposedAndBr
   // Arrange
   NodeParams params;
   params.gnss_pose_pub_method = 0;
-  params.use_gnss_ins_orientation = true;
+  params.orientation_source = "ins";
   params.base_frame = "my_base";
   params.gnss_base_frame = "my_gnss_base";
   params.map_frame = "my_map";
