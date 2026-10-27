@@ -27,6 +27,7 @@
   <depend>geographiclib</depend>
   <depend>geometry_msgs</depend>
   <depend>libexpected-dev</depend>
+  <depend>rcl_interfaces</depend>
   <depend>rclcpp</depend>
   <depend>rclcpp_components</depend>
   <depend>sensor_msgs</depend>

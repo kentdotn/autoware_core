@@ -21,10 +21,15 @@
           "default": "map",
           "description": "frame id for map_frame"
         },
+        "orientation_source": {
+          "type": "string",
+          "enum": ["ins", "motion", "none", "ins_or_none"],
+          "default": "none",
+          "description": "Where the orientation of the pose comes from. ins: the latest autoware_orientation; no pose until the first one arrives. motion: the heading of the displacement between consecutive positions. none: unknown, the identity (heading east) with an rmse of 1.0 rad. ins_or_none (deprecated): ins once autoware_orientation has arrived, none until then."
+        },
         "use_gnss_ins_orientation": {
           "type": "boolean",
-          "default": "true",
-          "description": "use Gnss-Ins orientation"
+          "description": "Deprecated: set orientation_source instead. Read only when orientation_source is not set: true is read as ins_or_none, false as motion."
         },
         "gnss_pose_pub_method": {
           "type": "integer",
@@ -44,7 +49,7 @@
         "base_frame",
         "gnss_base_frame",
         "map_frame",
-        "use_gnss_ins_orientation",
+        "orientation_source",
         "gnss_pose_pub_method",
         "buff_epoch"
       ]
