@@ -25,7 +25,7 @@
           "type": "string",
           "enum": ["ins", "motion", "none", "ins_or_none"],
           "default": "none",
-          "description": "Where the orientation of the pose comes from. ins: the latest autoware_orientation; no pose until the first one arrives. motion: the heading of the displacement between consecutive positions. none: unknown, the identity (heading east) with an rmse of 1.0 rad. ins_or_none (deprecated): ins once autoware_orientation has arrived, none until then."
+          "description": "Where the orientation of the pose comes from. ins: the latest autoware_orientation; no pose until the first one arrives. motion: the heading of the displacement between consecutive positions; no pose for the first one. none: unknown, the identity (heading east) with an rmse of 1.0 rad. ins_or_none (deprecated): ins once autoware_orientation has arrived, none until then."
         },
         "use_gnss_ins_orientation": {
           "type": "boolean",
