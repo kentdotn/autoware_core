@@ -46,6 +46,7 @@ public:
 
 private:
   GnssPoserParams declare_gnss_poser_params();
+  OrientationSource declare_orientation_source();
 
   void callback_map_projector_info(
     const AUTOWARE_MESSAGE_CONST_SHARED_PTR(autoware_map_msgs::msg::MapProjectorInfo) & msg);
@@ -81,6 +82,8 @@ private:
   AUTOWARE_PUBLISHER_PTR(autoware_internal_debug_msgs::msg::BoolStamped) fixed_pub_;
 
   const std::string base_frame_;
+  // Read from orientation_source, or from use_gnss_ins_orientation when only that is set.
+  const OrientationSource orientation_source_;
 
   AntennaTransformFailureFilter antenna_transform_failure_filter_;
   GnssPoser gnss_poser_;

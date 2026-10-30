@@ -14,6 +14,7 @@
 
 #include "gnss_poser_node.hpp"
 
+#include <rcl_interfaces/msg/parameter_descriptor.hpp>
 #include <tf2/time.hpp>
 
 #include <autoware_sensing_msgs/msg/gnss_ins_orientation_stamped.hpp>
@@ -48,6 +49,55 @@ GnssPosePubMethod to_gnss_pose_pub_method(const int value)
         std::to_string(value));
   }
 }
+
+OrientationSource to_orientation_source(const std::string & value)
+{
+  if (value == "ins") {
+    return OrientationSource::Ins;
+  }
+  if (value == "motion") {
+    return OrientationSource::Motion;
+  }
+  if (value == "none") {
+    return OrientationSource::None;
+  }
+  if (value == "ins_or_none") {
+    return OrientationSource::InsOrNone;
+  }
+  throw std::invalid_argument(
+    "orientation_source must be ins, motion, none or ins_or_none, got " + value);
+}
+
+const char * to_string(const OrientationSource source)
+{
+  switch (source) {
+    case OrientationSource::Ins:
+      return "ins";
+    case OrientationSource::Motion:
+      return "motion";
+    case OrientationSource::None:
+      return "none";
+    case OrientationSource::InsOrNone:
+      return "ins_or_none";
+  }
+  return "unknown";
+}
+
+// A parameter that may be left out: std::nullopt when no value is given. A value of another type
+// than T makes the node fail to start, as for a parameter declared with its type.
+template <typename T>
+std::optional<T> declare_optional_parameter(
+  autoware::agnocast_wrapper::Node & node, const std::string & name)
+{
+  rcl_interfaces::msg::ParameterDescriptor descriptor;
+  descriptor.dynamic_typing = true;
+  const rclcpp::ParameterValue & value =
+    node.declare_parameter(name, rclcpp::ParameterValue{}, descriptor);
+  if (value.get_type() == rclcpp::ParameterType::PARAMETER_NOT_SET) {
+    return std::nullopt;
+  }
+  return value.get<T>();
+}
 }  // namespace
 
 GnssPoserNode::GnssPoserNode(const rclcpp::NodeOptions & node_options)
@@ -55,11 +105,14 @@ GnssPoserNode::GnssPoserNode(const rclcpp::NodeOptions & node_options)
   tf2_listener_(tf2_buffer_, *this),
   tf2_broadcaster_(*this),
   base_frame_(declare_parameter<std::string>("base_frame")),
+  orientation_source_(declare_orientation_source()),
   antenna_transform_failure_filter_(antenna_frame_grace_period),
   gnss_poser_(declare_gnss_poser_params(), [this](const std::string & gnss_frame) {
     return get_static_transform(gnss_frame, base_frame_);
   })
 {
+  RCLCPP_INFO(this->get_logger(), "orientation_source: %s", to_string(orientation_source_));
+
   // Subscribe to map_projector_info topic
   sub_map_projector_info_ = create_subscription<autoware_map_msgs::msg::MapProjectorInfo>(
     "/map/map_projector_info", rclcpp::QoS{1}.transient_local(),
@@ -87,11 +140,50 @@ GnssPoserParams GnssPoserNode::declare_gnss_poser_params()
   GnssPoserParams params;
   params.gnss_base_frame = declare_parameter<std::string>("gnss_base_frame");
   params.map_frame = declare_parameter<std::string>("map_frame");
-  params.use_gnss_ins_orientation = declare_parameter<bool>("use_gnss_ins_orientation");
+  params.orientation_source = orientation_source_;
   params.gnss_pose_pub_method =
     to_gnss_pose_pub_method(declare_parameter<int>("gnss_pose_pub_method"));
   params.buff_epoch = declare_parameter<int>("buff_epoch");
   return params;
+}
+
+// orientation_source replaces use_gnss_ins_orientation. Configurations written before it set only
+// the old parameter, so either one is enough: the old one is read as ins_or_none (true) or motion
+// (false), and ignored when orientation_source is set.
+OrientationSource GnssPoserNode::declare_orientation_source()
+{
+  const std::optional<std::string> source =
+    declare_optional_parameter<std::string>(*this, "orientation_source");
+  const std::optional<bool> use_gnss_ins_orientation =
+    declare_optional_parameter<bool>(*this, "use_gnss_ins_orientation");
+
+  if (!source) {
+    if (!use_gnss_ins_orientation) {
+      throw std::invalid_argument("orientation_source must be set");
+    }
+    const OrientationSource legacy_source =
+      *use_gnss_ins_orientation ? OrientationSource::InsOrNone : OrientationSource::Motion;
+    RCLCPP_WARN(
+      this->get_logger(),
+      "use_gnss_ins_orientation is deprecated; set orientation_source instead. "
+      "use_gnss_ins_orientation: %s is read as orientation_source: %s.",
+      *use_gnss_ins_orientation ? "true" : "false", to_string(legacy_source));
+    return legacy_source;
+  }
+
+  if (use_gnss_ins_orientation) {
+    RCLCPP_WARN(
+      this->get_logger(),
+      "use_gnss_ins_orientation is deprecated and ignored because orientation_source is set.");
+  }
+  const OrientationSource orientation_source = to_orientation_source(*source);
+  if (orientation_source == OrientationSource::InsOrNone) {
+    RCLCPP_WARN(
+      this->get_logger(),
+      "orientation_source: ins_or_none is deprecated. Use ins when autoware_orientation is "
+      "published, none otherwise.");
+  }
+  return orientation_source;
 }
 
 void GnssPoserNode::callback_map_projector_info(
@@ -131,6 +223,12 @@ void GnssPoserNode::callback_nav_sat_fix(
         "Buffering Position. Output Skipped.");
       break;
 
+    case GnssPoser::Outcome::NoOrientation:
+      RCLCPP_WARN_STREAM_THROTTLE(
+        this->get_logger(), *this->get_clock(), std::chrono::milliseconds(1000).count(),
+        "autoware_orientation has not been received yet. Output Skipped.");
+      break;
+
     case GnssPoser::Outcome::NoAntennaTransform:
       // The receiver has a position solution, which is what gnss_fixed reports; only the pose
       // cannot be derived. get_static_transform() has already warned about the missing transform.
@@ -165,6 +263,12 @@ void GnssPoserNode::callback_gnss_ins_orientation_stamped(
   const AUTOWARE_MESSAGE_CONST_SHARED_PTR(autoware_sensing_msgs::msg::GnssInsOrientationStamped) &
   msg)
 {
+  if (orientation_source_ == OrientationSource::None) {
+    RCLCPP_WARN_ONCE(
+      this->get_logger(),
+      "autoware_orientation is received but ignored because orientation_source is none. Set "
+      "orientation_source to ins to use it.");
+  }
   gnss_poser_.set_ins_orientation(msg->orientation);
 }
 
