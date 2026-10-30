@@ -16,6 +16,7 @@
 
 #include <autoware/geography_utils/height.hpp>
 #include <autoware/geography_utils/projection.hpp>
+#include <builtin_interfaces/msg/time.hpp>
 #include <tf2/LinearMath/Quaternion.hpp>
 #include <tf2/LinearMath/Transform.hpp>
 
@@ -29,6 +30,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <numeric>
 #include <stdexcept>
@@ -280,12 +282,17 @@ GnssPoser::Result GnssPoser::input_fix(const sensor_msgs::msg::NavSatFix & fix)
 
   gnss_antenna_pose.orientation = orientation;
 
-  // get TF from gnss_antenna to base_link. If it cannot be obtained, the antenna pose is published
-  // as the base_link pose, i.e. the identity transform is used (a default-constructed Transform has
-  // zero translation and rotation w = 1).
-  const geometry_msgs::msg::Transform antenna_to_base_link =
-    lookup_antenna_to_base_link_(fix.header.frame_id, fix.header.stamp)
-      .value_or(geometry_msgs::msg::Transform{});
+  // get TF from gnss_antenna to base_link. Without it the fix cannot be expressed as a base_link
+  // pose, so it is dropped. The transform is static, so this does not resolve by asking for
+  // another time; it resolves once the transform is published.
+  const std::optional<geometry_msgs::msg::Transform> antenna_to_base_link =
+    lookup_antenna_to_base_link_(fix.header.frame_id);
+
+  if (!antenna_to_base_link.has_value()) {
+    return {
+      Outcome::NoAntennaTransform, make_gnss_fixed(fix.header.stamp, true), std::nullopt,
+      std::nullopt, std::nullopt};
+  }
 
   std::array<double, 3> rotation_variances{};
   if (params_.use_gnss_ins_orientation) {
@@ -298,7 +305,7 @@ GnssPoser::Result GnssPoser::input_fix(const sensor_msgs::msg::NavSatFix & fix)
 
   geometry_msgs::msg::PoseWithCovariance gnss_base_pose_with_covariance;
   gnss_base_pose_with_covariance.pose =
-    compose_base_link_pose(gnss_antenna_pose, antenna_to_base_link);
+    compose_base_link_pose(gnss_antenna_pose, antenna_to_base_link.value());
   gnss_base_pose_with_covariance.covariance =
     make_pose_covariance(fix, rotation_variances, covariance_defaults_.unknown_position_variances);
 
@@ -314,6 +321,28 @@ GnssPoser::Result GnssPoser::input_fix(const sensor_msgs::msg::NavSatFix & fix)
   return {
     Outcome::Published, make_gnss_fixed(fix.header.stamp, true), pose, pose_cov,
     make_transform_stamped(pose, params_.gnss_base_frame)};
+}
+
+AntennaTransformFailureFilter::AntennaTransformFailureFilter(const Clock::duration grace_period)
+: grace_period_(grace_period)
+{
+}
+
+bool AntennaTransformFailureFilter::record_failure(
+  const AntennaTransformFailure failure, const Clock::time_point now)
+{
+  if (!failing_since_.has_value()) {
+    failing_since_ = now;
+  }
+  if (failure == AntennaTransformFailure::Unresolvable) {
+    return true;
+  }
+  return now - failing_since_.value() > grace_period_;
+}
+
+void AntennaTransformFailureFilter::record_success()
+{
+  failing_since_.reset();
 }
 
 }  // namespace autoware::gnss_poser

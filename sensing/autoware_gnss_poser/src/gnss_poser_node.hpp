@@ -19,6 +19,7 @@
 #include <autoware/agnocast_wrapper/node.hpp>
 #include <autoware/agnocast_wrapper/tf2.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <tf2/exceptions.hpp>
 #include <tf2/transform_datatypes.hpp>
 
 #include <autoware_internal_debug_msgs/msg/bool_stamped.hpp>
@@ -54,11 +55,15 @@ private:
     const AUTOWARE_MESSAGE_CONST_SHARED_PTR(autoware_sensing_msgs::msg::GnssInsOrientationStamped) &
     msg);
 
-  // The transform between the two frames at `stamp`, or std::nullopt (with a throttled warning)
-  // when TF cannot provide it.
+  // The latest transform between the two frames, or std::nullopt when TF cannot provide it. The
+  // antenna sits rigidly on the vehicle, so the transform is static and the latest one is the one
+  // that applies to every fix.
   std::optional<geometry_msgs::msg::Transform> get_static_transform(
-    const std::string & target_frame, const std::string & source_frame,
-    const builtin_interfaces::msg::Time & stamp);
+    const std::string & target_frame, const std::string & source_frame);
+  // Log a failed lookup as a throttled error, unless AntennaTransformFailureFilter holds it back.
+  void report_transform_failure(
+    AntennaTransformFailure failure, const tf2::TransformException & ex,
+    const std::string & target_frame, const std::string & source_frame);
   // Publish the messages the pose computation produced.
   void publish_data(const GnssPoser::Result & result);
 
@@ -77,6 +82,7 @@ private:
 
   const std::string base_frame_;
 
+  AntennaTransformFailureFilter antenna_transform_failure_filter_;
   GnssPoser gnss_poser_;
 };
 }  // namespace autoware::gnss_poser
