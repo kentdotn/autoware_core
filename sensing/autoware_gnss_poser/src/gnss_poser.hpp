@@ -43,9 +43,10 @@ enum class GnssPosePubMethod { Instant = 0, Average = 1, Median = 2 };
 
 /// \brief Where the orientation of the published pose comes from.
 enum class OrientationSource {
-  Ins,     ///< the latest INS orientation; no pose until the first one has arrived
-  Motion,  ///< the heading of the displacement between consecutive positions
-  None,    ///< unknown: the identity (heading east) with the placeholder rmse
+  Ins,  ///< the latest INS orientation; no pose until the first one has arrived
+  /// The heading of the displacement between consecutive positions; no pose for the first one.
+  Motion,
+  None,  ///< unknown: the identity (heading east) with the placeholder rmse
   /// The INS orientation once one has arrived, the identity with the placeholder rmse until then.
   /// What use_gnss_ins_orientation = true did; deprecated.
   InsOrNone,
@@ -122,7 +123,9 @@ public:
     LocalProjector,   ///< the map uses a local projector, so a GNSS fix cannot be converted
     NotFixed,         ///< the receiver reports no fix; its status is known but no pose is computed
     Buffering,        ///< the position buffer is not full yet (average and median methods)
-    NoOrientation,    ///< orientation_source is ins and no INS orientation has arrived yet
+    /// the orientation source has nothing yet: no INS orientation (ins) or no previous position
+    /// (motion)
+    NoOrientation,
     NoAntennaTransform,  ///< the antenna frame of the fix cannot be transformed to base_link
     Published,           ///< a pose was computed, see Result::gnss_pose
   };

@@ -891,8 +891,8 @@ INSTANTIATE_TEST_SUITE_P(
 // read as ins_or_none (true) or motion (false), and ignored when orientation_source is set. The
 // source in use shows in the poses of one scenario: a fix, then the INS orientation (yaw pi/4),
 // then a fix north of the first. ins publishes only the second pose, with the INS yaw; ins_or_none
-// the identity, then the INS yaw; none the identity twice; motion the identity, then the heading
-// of the step (north, turned by the MGRS grid convergence).
+// the identity, then the INS yaw; none the identity twice; motion only the second pose, with the
+// heading of the step (north, turned by the MGRS grid convergence).
 TEST_P(GnssPoserOrientationSourceParameters, Construct_OrientationSourceParameters_SelectsTheSource)
 {
   // Arrange
@@ -940,16 +940,14 @@ INSTANTIATE_TEST_SUITE_P(
   EveryWayToSetIt, GnssPoserOrientationSourceParameters,
   ::testing::Values(
     OrientationSourceParameters{"Ins", "ins", std::nullopt, {PoseYaw::Ins}},
-    OrientationSourceParameters{
-      "Motion", "motion", std::nullopt, {PoseYaw::Identity, PoseYaw::Motion}},
+    OrientationSourceParameters{"Motion", "motion", std::nullopt, {PoseYaw::Motion}},
     OrientationSourceParameters{
       "None", "none", std::nullopt, {PoseYaw::Identity, PoseYaw::Identity}},
     OrientationSourceParameters{
       "InsOrNone", "ins_or_none", std::nullopt, {PoseYaw::Identity, PoseYaw::Ins}},
     OrientationSourceParameters{
       "LegacyTrue", std::nullopt, true, {PoseYaw::Identity, PoseYaw::Ins}},
-    OrientationSourceParameters{
-      "LegacyFalse", std::nullopt, false, {PoseYaw::Identity, PoseYaw::Motion}},
+    OrientationSourceParameters{"LegacyFalse", std::nullopt, false, {PoseYaw::Motion}},
     OrientationSourceParameters{
       "BothSet_OrientationSourceWins", "none", true, {PoseYaw::Identity, PoseYaw::Identity}}),
   [](const ::testing::TestParamInfo<OrientationSourceParameters> & info) {

@@ -226,7 +226,8 @@ void GnssPoserNode::callback_nav_sat_fix(
     case GnssPoser::Outcome::NoOrientation:
       RCLCPP_WARN_STREAM_THROTTLE(
         this->get_logger(), *this->get_clock(), std::chrono::milliseconds(1000).count(),
-        "autoware_orientation has not been received yet. Output Skipped.");
+        "No orientation yet (no autoware_orientation for orientation_source ins, no previous "
+        "position for motion). Output Skipped.");
       break;
 
     case GnssPoser::Outcome::NoAntennaTransform:

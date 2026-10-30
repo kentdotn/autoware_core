@@ -17,12 +17,12 @@ If the transformation from `base_link` to the antenna cannot be obtained, the fi
 
 NavSatFix carries no orientation. `orientation_source` selects where the orientation of the pose comes from:
 
-| Value                      | Orientation                                                                                      | Rotation covariance (roll, pitch, yaw)      |
-| -------------------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------- |
-| `ins`                      | the latest `autoware_orientation`. No pose is published until the first one has arrived.         | its `rmse_rotation_*` squared               |
-| `motion`                   | the heading of the displacement from the previous position to the current one (roll = pitch = 0) | 0.1, 0.1, 1.0 [rad^2]                       |
-| `none`                     | unknown: the identity, that is heading east in the map frame                                     | 1.0, 1.0, 1.0 [rad^2]                       |
-| `ins_or_none` (deprecated) | as `ins` once `autoware_orientation` has arrived, as `none` until then                           | as `ins`, or as `none` before the first one |
+| Value                      | Orientation                                                                                                                                                               | Rotation covariance (roll, pitch, yaw)      |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
+| `ins`                      | the latest `autoware_orientation`. No pose is published until the first one has arrived.                                                                                  | its `rmse_rotation_*` squared               |
+| `motion`                   | the heading of the displacement from the previous position to the current one (roll = pitch = 0). No pose is published for the first position, which has no previous one. | 0.1, 0.1, 1.0 [rad^2]                       |
+| `none`                     | unknown: the identity, that is heading east in the map frame                                                                                                              | 1.0, 1.0, 1.0 [rad^2]                       |
+| `ins_or_none` (deprecated) | as `ins` once `autoware_orientation` has arrived, as `none` until then                                                                                                    | as `ins`, or as `none` before the first one |
 
 `orientation_source` replaces `use_gnss_ins_orientation`, which is deprecated. A configuration that sets only `use_gnss_ins_orientation` still works and gets a warning at startup: `true` is read as `ins_or_none` (what it did) and `false` as `motion`. When both are set, `use_gnss_ins_orientation` is ignored. `ins_or_none` is deprecated as well, because a pose with the stand-in orientation cannot be told apart from one with a measured orientation: use `ins` when `autoware_orientation` is published and `none` otherwise.
 
