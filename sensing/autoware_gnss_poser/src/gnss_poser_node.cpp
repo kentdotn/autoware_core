@@ -20,7 +20,6 @@
 #include <autoware_sensing_msgs/msg/gnss_ins_orientation_stamped.hpp>
 
 #include <memory>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -167,6 +166,13 @@ void GnssPoserNode::log_issue(const GnssPoser::Issue & issue)
                               << issue.antenna_frame << " to " << base_frame_
                               << " is available; please publish it on TF. Fixes are skipped.");
       break;
+
+    case GnssPoser::Issue::Cause::TransformLookupFailed:
+      RCLCPP_ERROR_STREAM(
+        this->get_logger(), "Failed to look up the transform from \"" << issue.antenna_frame
+                                                                      << "\" to \"" << base_frame_
+                                                                      << "\". Fixes are skipped.");
+      break;
   }
 }
 
@@ -177,7 +183,8 @@ void GnssPoserNode::callback_gnss_ins_orientation_stamped(
   gnss_poser_.set_ins_orientation(msg->orientation);
 }
 
-std::optional<geometry_msgs::msg::Transform> GnssPoserNode::get_static_transform(
+tl::expected<geometry_msgs::msg::Transform, GnssPoser::TransformLookupError>
+GnssPoserNode::get_static_transform(
   const std::string & target_frame, const std::string & source_frame)
 {
   if (target_frame == source_frame) {
@@ -191,8 +198,15 @@ std::optional<geometry_msgs::msg::Transform> GnssPoserNode::get_static_transform
     // than /tf_static and the fix is newer than the last /tf message, which tf2 refuses to
     // extrapolate.
     return tf2_buffer_.lookupTransform(target_frame, source_frame, tf2::TimePointZero).transform;
+  } catch (const tf2::LookupException &) {
+    // A frame has not been received.
+    return tl::unexpected(GnssPoser::TransformLookupError::Unavailable);
+  } catch (const tf2::ConnectivityException &) {
+    // The transforms that connect the frames have not been received.
+    return tl::unexpected(GnssPoser::TransformLookupError::Unavailable);
   } catch (const tf2::TransformException &) {
-    return std::nullopt;
+    // e.g. InvalidArgumentException for a frame name that TF does not accept.
+    return tl::unexpected(GnssPoser::TransformLookupError::Failed);
   }
 }
 
