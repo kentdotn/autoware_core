@@ -16,6 +16,7 @@
 
 #include <autoware/geography_utils/height.hpp>
 #include <autoware/geography_utils/projection.hpp>
+#include <builtin_interfaces/msg/time.hpp>
 #include <tf2/LinearMath/Quaternion.hpp>
 #include <tf2/LinearMath/Transform.hpp>
 
@@ -297,17 +298,19 @@ GnssPoser::Result GnssPoser::process_fix(const sensor_msgs::msg::NavSatFix & fix
 
   gnss_antenna_pose.orientation = orientation;
 
-  // get TF from gnss_antenna to base_link. If it cannot be obtained, the antenna pose is published
-  // as the base_link pose, i.e. the identity transform is used (a default-constructed Transform has
-  // zero translation and rotation w = 1).
-  const auto transform = lookup_antenna_to_base_link_(fix.header.frame_id, fix.header.stamp);
+  // get TF from gnss_antenna to base_link. Without it the fix cannot be expressed as a base_link
+  // pose, so it is dropped. The transform is static, so this does not resolve by asking for
+  // another time; it resolves once the transform is published.
+  const auto transform = lookup_antenna_to_base_link_(fix.header.frame_id);
   if (!transform.has_value()) {
     record_lookup_failure(fix.header.frame_id, fix.header.stamp);
-  } else {
-    clear_lookup_failure();
+
+    return {
+      Outcome::TransformLookupFailed, make_gnss_fixed(fix.header.stamp, true), std::nullopt,
+      std::nullopt, std::nullopt};
   }
-  const geometry_msgs::msg::Transform antenna_to_base_link =
-    transform.value_or(geometry_msgs::msg::Transform{});
+  clear_lookup_failure();
+  const geometry_msgs::msg::Transform antenna_to_base_link = transform.value();
 
   std::array<double, 3> rotation_variances{};
   if (params_.use_gnss_ins_orientation) {
