@@ -129,6 +129,9 @@ void GnssPoserNode::callback_nav_sat_fix(
         "Buffering Position. Output Skipped.");
       break;
 
+    // A missing antenna transform is reported through log_issue(), as GnssPoser knows how long it
+    // has been missing; a pose needs no log.
+    case GnssPoser::Outcome::TransformLookupFailed:
     case GnssPoser::Outcome::Published:
       break;
   }
@@ -160,8 +163,9 @@ void GnssPoserNode::log_issue(const GnssPoser::Issue & issue)
   switch (issue.cause) {
     case GnssPoser::Issue::Cause::TransformUnavailable:
       RCLCPP_ERROR_STREAM(
-        this->get_logger(), "No transform from " << issue.antenna_frame << " to " << base_frame_
-                                                 << " is available; please publish it on TF.");
+        this->get_logger(), "No transform from "
+                              << issue.antenna_frame << " to " << base_frame_
+                              << " is available; please publish it on TF. Fixes are skipped.");
       break;
   }
 }
