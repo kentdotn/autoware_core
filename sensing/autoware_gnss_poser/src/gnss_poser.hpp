@@ -14,6 +14,8 @@
 #ifndef GNSS_POSER_HPP_
 #define GNSS_POSER_HPP_
 
+#include <tl_expected/expected.hpp>
+
 #include <autoware_internal_debug_msgs/msg/bool_stamped.hpp>
 #include <autoware_map_msgs/msg/map_projector_info.hpp>
 #include <autoware_sensing_msgs/msg/gnss_ins_orientation.hpp>
@@ -98,8 +100,17 @@ struct GnssPoserCovarianceDefaults
 class GnssPoser
 {
 public:
+  /// \brief Why a TransformLookup could not provide the transform.
+  enum class TransformLookupError {
+    /// TF is not ready for the lookup yet: it has not received the frames, or not the transforms
+    /// that connect them. Expected right after startup, until the transform is published.
+    Unavailable,
+    /// TF was ready for the lookup, but the lookup failed.
+    Failed,
+  };
+
   /// \brief Resolves the transform from the antenna frame named in the fix header to base_link,
-  /// or std::nullopt when it cannot be resolved.
+  /// or the reason it cannot be resolved.
   ///
   /// The antenna is rigidly mounted on the vehicle, so this transform does not change over time
   /// and no stamp is passed; a moving antenna is out of scope. input_fix() calls the lookup only
@@ -107,15 +118,18 @@ public:
   /// Obtaining the transform (TF lookup, logging) is the caller's business; what to do when there
   /// is none is decided here.
   using TransformLookup =
-    std::function<std::optional<geometry_msgs::msg::Transform>(const std::string & antenna_frame)>;
+    std::function<tl::expected<geometry_msgs::msg::Transform, TransformLookupError>(
+      const std::string & antenna_frame)>;
 
   /// \brief An input that should be usable by now but is not.
   struct Issue
   {
     enum class Cause {
-      /// TransformLookup has given no transform for longer than antenna_transform_grace_period.
-      /// The transform may still be published.
+      /// TransformLookupError::Unavailable for longer than antenna_transform_grace_period. The
+      /// transform may still be published.
       TransformUnavailable,
+      /// TransformLookupError::Failed, which waiting is not expected to resolve.
+      TransformLookupFailed,
     };
 
     Cause cause;
@@ -144,8 +158,10 @@ public:
     LocalProjector,   ///< the map uses a local projector, so a GNSS fix cannot be converted
     NotFixed,         ///< the receiver reports no fix; its status is known but no pose is computed
     Buffering,        ///< the position buffer is not full yet (average and median methods)
-    TransformLookupFailed,  ///< TransformLookup could not provide the antenna transform
-    Published,              ///< a pose was computed, see Result::gnss_pose
+    /// TransformLookup gave a TransformLookupError, of either kind; the issue raised for it tells
+    /// which one.
+    TransformLookupFailed,
+    Published,  ///< a pose was computed, see Result::gnss_pose
   };
 
   /// \brief What the fix produced, as the messages to publish.
@@ -188,10 +204,11 @@ private:
   Result process_fix(const sensor_msgs::msg::NavSatFix & fix);
 
   // Issue management. Only these functions touch transform_lookup_failure_ and previous_stamp_.
-  // The transform for `frame` could not be looked up for the fix stamped `stamp`. A failure that
-  // continues keeps its start, so that the grace period runs from there.
+  // The transform for `frame` could not be looked up for the fix stamped `stamp`, for `error`. A
+  // failure that continues keeps its start, so that the grace period runs from there.
   void record_lookup_failure(
-    const std::string & frame, const builtin_interfaces::msg::Time & stamp);
+    const std::string & frame, TransformLookupError error,
+    const builtin_interfaces::msg::Time & stamp);
   // The transform could be looked up.
   void clear_lookup_failure();
   // Raise transform_lookup_failure_ as an issue through on_issue_raised_ once it is one at the fix
@@ -209,12 +226,13 @@ private:
   geometry_msgs::msg::Point prev_position_;
   bool has_prev_position_ = false;
   autoware_sensing_msgs::msg::GnssInsOrientation ins_orientation_;
-  // The antenna transform the latest fix to reach the lookup could not get: for which frame, since
-  // when that has been so, and whether it has been raised as an issue, so that it is raised once.
-  // Kept across fixes that do not reach the lookup, as they say nothing about it.
+  // The antenna transform the latest fix to reach the lookup could not get: for which frame, why,
+  // since when that has been so, and whether it has been raised as an issue, so that it is raised
+  // once. Kept across fixes that do not reach the lookup, as they say nothing about it.
   struct TransformLookupFailure
   {
     std::string frame;
+    TransformLookupError error;
     StampTime since;
     bool raised = false;
   };
