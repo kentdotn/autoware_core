@@ -11,7 +11,7 @@ This node subscribes to NavSatFix to publish the pose of **base_link**. The data
 
 The antenna is rigidly mounted on the vehicle, so this transformation is expected to be static; an antenna that moves relative to `base_link` is out of scope. Publishing it on `/tf_static` is recommended, but a setup that publishes the same fixed relation on `/tf` is supported as well: the node looks up the latest transform rather than the transform at the fix's `header.stamp`, which `/tf` cannot always provide.
 
-If the transformation from `base_link` to the antenna cannot be obtained, it outputs the pose of the antenna position without performing coordinate transformation.
+If the transformation from `base_link` to the antenna cannot be obtained, it outputs the pose of the antenna position without performing coordinate transformation. This is expected right after startup, before the transformation has been received, so nothing is logged for up to 5 seconds, counted from the first fix that could not get it. After that, the node logs an error once, naming both frames, so that a `header.frame_id` that never gets a transformation is visible. The problem is logged once when it arises rather than for every fix.
 
 ## Inputs / Outputs
 

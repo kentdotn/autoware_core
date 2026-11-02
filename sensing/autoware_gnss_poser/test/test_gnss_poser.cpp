@@ -44,6 +44,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <optional>
 #include <stdexcept>
@@ -62,6 +63,8 @@ using geometry_msgs::msg::Quaternion;
 using geometry_msgs::msg::Transform;
 using sensor_msgs::msg::NavSatFix;
 using sensor_msgs::msg::NavSatStatus;
+using std::chrono_literals::operator""ms;
+using std::chrono_literals::operator""s;
 
 // ---------------------------------------------------------------------------------------
 // Reference input used throughout (same point as autoware_geography_utils' own tests).
@@ -410,6 +413,9 @@ const GnssPoser::TransformLookup identity_lookup = [](const std::string &) {
   return std::optional<Transform>(Transform{});
 };
 
+// The time every fix is received at, in the cases that are not about how long an input is missing.
+const GnssPoser::Clock::time_point fix_time{};
+
 // A GnssPoser that has received the MGRS projector info.
 GnssPoser make_poser_with_mgrs_projector(const GnssPoserParams & params)
 {
@@ -422,7 +428,7 @@ GnssPoser make_poser_with_mgrs_projector(const GnssPoserParams & params)
 void input_fixes(GnssPoser & poser, const std::vector<NavSatFix> & fixes)
 {
   for (const auto & fix : fixes) {
-    poser.input_fix(fix);
+    poser.input_fix(fix, fix_time);
   }
 }
 
@@ -496,6 +502,33 @@ struct CovarianceType
 class GnssPoserKnownCovarianceType : public ::testing::TestWithParam<CovarianceType>
 {
 };
+
+constexpr std::chrono::milliseconds grace_period =
+  autoware::gnss_poser::antenna_transform_grace_period;
+constexpr std::chrono::milliseconds beyond_grace_period = grace_period + 1ms;
+
+// What the antenna transform lookup gives for a fix, or that the fix does not reach it.
+enum class Lookup { Available, Unavailable, NotReached };
+
+// One fix: when it is received after the first one, the antenna frame it names, and its lookup.
+struct ReceivedFix
+{
+  std::chrono::milliseconds received_after;
+  const char * antenna_frame;
+  Lookup lookup;
+};
+
+// A sequence of fixes and the antenna transform issues it should raise, in order.
+struct AntennaTransformIssueCase
+{
+  const char * name;
+  std::vector<ReceivedFix> fixes;
+  std::vector<GnssPoser::Issue> raised;
+};
+
+class GnssPoserAntennaTransformIssue : public ::testing::TestWithParam<AntennaTransformIssueCase>
+{
+};
 }  // namespace
 
 // =======================================================================================
@@ -510,7 +543,7 @@ TEST(GnssPoser, Gate_BeforeMapProjectorInfo_PublishesNothing)
 
   // Act
   // No projector info yet: the fix is dropped, and not even gnss_fixed is published.
-  const auto result = poser.input_fix(make_reference_fix());
+  const auto result = poser.input_fix(make_reference_fix(), fix_time);
 
   // Assert
   expect_no_output(result);
@@ -524,7 +557,7 @@ TEST(GnssPoser, GnssFixed_StampIsFixHeaderStamp)
   const auto fix = make_reference_fix(NavSatStatus::STATUS_NO_FIX);
 
   // Act
-  const auto result = poser.input_fix(fix);
+  const auto result = poser.input_fix(fix, fix_time);
 
   // Assert
   EXPECT_EQ(result.gnss_fixed.value().stamp, fix.header.stamp);
@@ -540,13 +573,13 @@ TEST(GnssPoser, Gate_LocalProjector_PublishesNothingNotEvenGnssFixed)
 {
   // Arrange
   GnssPoser poser = make_poser_with_mgrs_projector({});
-  poser.input_fix(make_reference_fix());
+  poser.input_fix(make_reference_fix(), fix_time);
   // The latest projector info wins: LOCAL disables processing. Its arrival publishes nothing,
   // and the next fix is dropped entirely.
   poser.set_projector_info(make_local_projector_info());
 
   // Act
-  const auto result = poser.input_fix(make_reference_fix());
+  const auto result = poser.input_fix(make_reference_fix(), fix_time);
 
   // Assert
   expect_no_output(result);
@@ -556,16 +589,16 @@ TEST(GnssPoser, Gate_MgrsProjectorAfterLocal_ReenablesProcessing)
 {
   // Arrange
   GnssPoser poser = make_poser_with_mgrs_projector({});
-  poser.input_fix(make_reference_fix());
+  poser.input_fix(make_reference_fix(), fix_time);
   // The latest projector info wins: LOCAL disables processing. Its arrival publishes nothing,
   // and the next fix is dropped entirely.
   poser.set_projector_info(make_local_projector_info());
-  poser.input_fix(make_reference_fix());
+  poser.input_fix(make_reference_fix(), fix_time);
   // Switching back re-enables processing, again without replaying the dropped fix.
   poser.set_projector_info(make_mgrs_projector_info());
 
   // Act
-  const auto result = poser.input_fix(make_reference_fix());
+  const auto result = poser.input_fix(make_reference_fix(), fix_time);
 
   // Assert
   expect_every_output(result);
@@ -580,7 +613,7 @@ TEST_P(GnssPoserFixedStatus, Gate_SbasOrGbasFixStatus_Passes)
 
   // Act
   // is_fixed(status) <=> status >= STATUS_FIX (0)
-  const auto result = poser.input_fix(make_reference_fix(GetParam().status));
+  const auto result = poser.input_fix(make_reference_fix(GetParam().status), fix_time);
 
   // Assert
   expect_every_output(result);
@@ -605,7 +638,7 @@ TEST(GnssPoser, Gate_StatusNoFixAfterAcceptedFixes_PublishesOnlyGnssFixedFalse)
             make_reference_fix(NavSatStatus::STATUS_GBAS_FIX)});
 
   // Act
-  const auto result = poser.input_fix(make_reference_fix(NavSatStatus::STATUS_NO_FIX));
+  const auto result = poser.input_fix(make_reference_fix(NavSatStatus::STATUS_NO_FIX), fix_time);
 
   // Assert
   expect_only_gnss_fixed(result);
@@ -639,7 +672,7 @@ TEST(GnssPoser, MethodInstant_PublishesProjectedAntennaPosition)
   const auto expected_antenna = project_antenna(fix, projector);
 
   // Act
-  const auto result = poser.input_fix(fix);
+  const auto result = poser.input_fix(fix, fix_time);
 
   // Assert
   const auto & pose = result.gnss_pose.value();
@@ -670,7 +703,7 @@ TEST(GnssPoser, MethodInstant_LargeBuffEpoch_FirstFixPublishedInstantly)
   const auto fixes = make_instant_fixes();
 
   // Act
-  const auto result = poser.input_fix(fixes[0]);
+  const auto result = poser.input_fix(fixes[0], fix_time);
 
   // Assert
   expect_every_output(result);
@@ -698,7 +731,7 @@ TEST(GnssPoser, MethodInstant_Egm2008VerticalDatum_ConvertsHeightFromWgs84)
   const auto fix = make_reference_fix();
 
   // Act
-  const auto result = poser.input_fix(fix);
+  const auto result = poser.input_fix(fix, fix_time);
 
   // Assert
   expect_point_near(
@@ -723,7 +756,7 @@ TEST(GnssPoser, MethodInstant_LocalCartesianUtmProjector_UsesMapOrigin)
   const auto fix = make_reference_fix();
 
   // Act
-  const auto result = poser.input_fix(fix);
+  const auto result = poser.input_fix(fix, fix_time);
 
   // Assert
   // Literal expectation: the fix sits on the origin, so only the altitude offset remains.
@@ -744,7 +777,7 @@ TEST(GnssPoser, MethodAverage_BufferBecomesFull_PublishesMean)
 
   // Act
   // Fix 3 completes the buffer: the third gnss_fixed comes with the first pose, the mean of 1..3.
-  const auto result = poser.input_fix(fixes[2]);
+  const auto result = poser.input_fix(fixes[2], fix_time);
 
   // Assert
   expect_every_output(result);
@@ -764,7 +797,7 @@ TEST(GnssPoser, MethodAverage_BufferFull_SlidingWindowMean)
 
   // Act
   // Fix 4 slides the window: the mean of 2..4, the oldest sample dropped.
-  const auto result = poser.input_fix(fixes[3]);
+  const auto result = poser.input_fix(fixes[3], fix_time);
 
   // Assert
   expect_every_output(result);
@@ -784,7 +817,7 @@ TEST(GnssPoser, MethodMedian_BufferNotFull_PublishesOnlyGnssFixed)
   input_fixes(poser, {fixes[0]});
 
   // Act
-  const auto result = poser.input_fix(fixes[1]);
+  const auto result = poser.input_fix(fixes[1], fix_time);
 
   // Assert
   expect_only_gnss_fixed(result);
@@ -812,7 +845,7 @@ TEST(GnssPoser, MethodMedian_OddBuffer_ComponentWiseMedian)
 
   // Act
   // Fix 3 completes the buffer: the component-wise median of 1..3.
-  const auto result = poser.input_fix(fixes[2]);
+  const auto result = poser.input_fix(fixes[2], fix_time);
 
   // Assert
   expect_every_output(result);
@@ -829,7 +862,7 @@ TEST(GnssPoser, MethodMedian_EvenBuffer_AveragesTwoCentralValues)
   input_fixes(poser, {fixes[0], fixes[1], fixes[2]});
 
   // Act
-  const auto result = poser.input_fix(fixes[3]);
+  const auto result = poser.input_fix(fixes[3], fix_time);
 
   // Assert
   expect_point_near(
@@ -848,7 +881,7 @@ TEST(GnssPoser, Buffer_IsNotAffectedByNonFixedMessages)
   input_fixes(poser, {fixes[0], fixes[1]});
 
   // Act
-  const auto result = poser.input_fix(fixes[2]);
+  const auto result = poser.input_fix(fixes[2], fix_time);
 
   // Assert
   expect_point_near(
@@ -863,13 +896,13 @@ TEST(GnssPoser, Buffer_FirstFixAfterGatedFixes_FillsOnlyOneSlot)
   // Arrange
   const auto fixes = make_gated_buffer_fixes();
   GnssPoser poser(make_buffer_params(1, 2), identity_lookup);
-  poser.input_fix(fixes[0]);  // no projector info yet
+  poser.input_fix(fixes[0], fix_time);  // no projector info yet
   poser.set_projector_info(make_local_projector_info());
-  poser.input_fix(fixes[1]);  // LOCAL projector
+  poser.input_fix(fixes[1], fix_time);  // LOCAL projector
   poser.set_projector_info(make_mgrs_projector_info());
 
   // Act
-  const auto result = poser.input_fix(fixes[2]);
+  const auto result = poser.input_fix(fixes[2], fix_time);
 
   // Assert
   expect_only_gnss_fixed(result);  // one slot filled, not full
@@ -892,7 +925,7 @@ TEST(GnssPoser, InsOrientation_NewerMessage_ReplacesPrevious)
   poser.set_ins_orientation(make_orientation(-M_PI / 4.0, 0.5, 0.6, 0.7));
 
   // Act
-  const auto result = poser.input_fix(make_reference_fix());
+  const auto result = poser.input_fix(make_reference_fix(), fix_time);
 
   // Assert
   EXPECT_NEAR(yaw_of(pose_of(result).orientation), -M_PI / 4.0, angle_tolerance);
@@ -922,7 +955,7 @@ TEST(GnssPoser, InsOrientation_NoMessageYet_IdentityAndUnitCovariance)
   const auto expected_antenna = project_antenna(fix, projector);
 
   // Act
-  const auto result = poser.input_fix(fix);
+  const auto result = poser.input_fix(fix, fix_time);
 
   // Assert
   EXPECT_TRUE(result.gnss_fixed.value().data);
@@ -956,7 +989,7 @@ TEST(GnssPoser, MotionOrientation_FirstFix_IdentityAndConstantCovariance)
 
   // Act
   // First fix: no previous position => yaw = atan2(0, 0) = 0 (identity).
-  const auto result = poser.input_fix(fixes[0]);
+  const auto result = poser.input_fix(fixes[0], fix_time);
 
   // Assert
   expect_same_rotation(pose_of(result).orientation, yaw_to_quaternion(0.0));
@@ -989,7 +1022,7 @@ TEST(GnssPoser, MotionOrientation_ThirdFix_YawFromLatestStepOnly)
   // Third fix: the heading follows the latest displacement only. It is atan2(p3 - p2), the heading
   // of the step just made, and not atan2(p3 - p1) or anything carried over from the previous
   // heading.
-  const auto result = poser.input_fix(fixes[2]);
+  const auto result = poser.input_fix(fixes[2], fix_time);
 
   // Assert
   EXPECT_NEAR(yaw_of(pose_of(result).orientation), yaw_step, angle_tolerance);
@@ -1013,7 +1046,7 @@ TEST(GnssPoser, MotionOrientation_StandingStill_YawSnapsToZero)
 
   // Act
   // Standing still: displacement is zero => yaw snaps back to 0, not "keep last heading".
-  const auto result = poser.input_fix(fixes[2]);
+  const auto result = poser.input_fix(fixes[2], fix_time);
 
   // Assert
   expect_same_rotation(pose_of(result).orientation, yaw_to_quaternion(0.0));
@@ -1039,11 +1072,11 @@ TEST(GnssPoser, MotionOrientation_PreviousPositionSurvivesNonFixedMessages)
   const auto p1 = project_antenna(fix1, projector);
   const auto p2 = project_antenna(fix2, projector);
   const double expected_yaw = std::atan2(p2.y - p1.y, p2.x - p1.x);
-  poser.input_fix(fix1);
-  poser.input_fix(no_fix);
+  poser.input_fix(fix1, fix_time);
+  poser.input_fix(no_fix, fix_time);
 
   // Act
-  const auto result = poser.input_fix(fix2);
+  const auto result = poser.input_fix(fix2, fix_time);
 
   // Assert
   EXPECT_NEAR(yaw_of(pose_of(result).orientation), expected_yaw, angle_tolerance);
@@ -1063,7 +1096,7 @@ TEST(GnssPoser, MotionOrientation_WithBuffer_UsesFilteredPositions)
   input_fixes(poser, {fixes[0], fixes[1]});
 
   // Act
-  const auto result = poser.input_fix(fixes[2]);
+  const auto result = poser.input_fix(fixes[2], fix_time);
 
   // Assert
   // Heading is derived from consecutive *averaged* positions, not raw antenna positions.
@@ -1089,7 +1122,7 @@ TEST_P(GnssPoserMotionHeading, MotionOrientation_CardinalDirection_YawFromDispla
   input_fixes(poser, {from});
 
   // Act
-  const auto result = poser.input_fix(to);
+  const auto result = poser.input_fix(to, fix_time);
 
   // Assert
   expect_same_rotation(pose_of(result).orientation, yaw_to_quaternion(expected_yaw));
@@ -1116,7 +1149,7 @@ TEST_P(GnssPoserKnownCovarianceType, Covariance_KnownType_CopiesDiagonalFromFix)
   poser.set_ins_orientation(make_orientation(0.0, 0.1, 0.2, 0.3));
 
   // Act
-  const auto result = poser.input_fix(make_fix_with_covariance(GetParam().type));
+  const auto result = poser.input_fix(make_fix_with_covariance(GetParam().type), fix_time);
 
   // Assert
   expect_position_variances(covariance_of(result), 2.0, 3.0, 4.0);
@@ -1139,7 +1172,8 @@ TEST(GnssPoser, Covariance_UnknownType_PositionVariancesAreTen)
   poser.set_ins_orientation(make_orientation(0.0, 0.1, 0.2, 0.3));
 
   // Act
-  const auto result = poser.input_fix(make_fix_with_covariance(NavSatFix::COVARIANCE_TYPE_UNKNOWN));
+  const auto result =
+    poser.input_fix(make_fix_with_covariance(NavSatFix::COVARIANCE_TYPE_UNKNOWN), fix_time);
 
   // Assert
   {
@@ -1156,3 +1190,96 @@ TEST(GnssPoser, Covariance_UnknownType_PositionVariancesAreTen)
     }
   }
 }
+
+// =======================================================================================
+// 6. Antenna transform
+// =======================================================================================
+
+// An unavailable antenna transform is expected right after startup, so it is raised as an issue
+// only once it has been unavailable for longer than the grace period, measured from the first fix
+// that could not get it for the same frame. The callback receives it once when it is raised, not
+// again while it persists. A fix that gets the transform clears it, so it can be raised again; a
+// fix that does not reach the lookup says nothing about the transform but still moves the time.
+TEST_P(GnssPoserAntennaTransformIssue, IssueRaisedCallback_AfterFixes_ReceivesEachRaisedIssueOnce)
+{
+  // Arrange
+  Lookup lookup = Lookup::Available;
+  std::vector<GnssPoser::Issue> raised;
+  GnssPoser poser(
+    {},
+    [&lookup](const std::string &) {
+      std::optional<Transform> transform;
+      if (lookup != Lookup::Unavailable) {
+        transform = Transform{};
+      }
+      return transform;
+    },
+    [&raised](const GnssPoser::Issue & issue) { raised.push_back(issue); });
+  poser.set_projector_info(make_mgrs_projector_info());
+
+  // Act
+  for (const ReceivedFix & received : GetParam().fixes) {
+    lookup = received.lookup;
+    NavSatStatus::_status_type status = NavSatStatus::STATUS_FIX;
+    if (received.lookup == Lookup::NotReached) {
+      status = NavSatStatus::STATUS_NO_FIX;  // stops before the lookup
+    }
+    NavSatFix fix = make_reference_fix(status);
+    fix.header.frame_id = received.antenna_frame;
+    poser.input_fix(fix, fix_time + received.received_after);
+  }
+
+  // Assert
+  const std::vector<GnssPoser::Issue> & expected = GetParam().raised;
+  ASSERT_EQ(raised.size(), expected.size());
+  for (std::size_t i = 0; i < raised.size(); ++i) {
+    EXPECT_EQ(raised[i].cause, expected[i].cause) << "issue " << i;
+    EXPECT_EQ(raised[i].antenna_frame, expected[i].antenna_frame) << "issue " << i;
+  }
+}
+
+const GnssPoser::Issue gnss_unavailable{GnssPoser::Issue::Cause::TransformUnavailable, "gnss"};
+
+INSTANTIATE_TEST_SUITE_P(
+  FixSequences, GnssPoserAntennaTransformIssue,
+  ::testing::Values(
+    AntennaTransformIssueCase{
+      "UnavailableForTheGracePeriod",
+      {{0ms, "gnss", Lookup::Unavailable}, {grace_period, "gnss", Lookup::Unavailable}},
+      {}},
+    AntennaTransformIssueCase{
+      "UnavailableBeyondTheGracePeriod",
+      {{0ms, "gnss", Lookup::Unavailable}, {beyond_grace_period, "gnss", Lookup::Unavailable}},
+      {gnss_unavailable}},
+    AntennaTransformIssueCase{
+      "StillUnavailableAfterRaised",
+      {{0ms, "gnss", Lookup::Unavailable},
+       {beyond_grace_period, "gnss", Lookup::Unavailable},
+       {beyond_grace_period + 1s, "gnss", Lookup::Unavailable}},
+      {gnss_unavailable}},
+    AntennaTransformIssueCase{
+      "UnavailableThenFixesNotReachingTheLookup",
+      {{0ms, "gnss", Lookup::Unavailable}, {beyond_grace_period, "gnss", Lookup::NotReached}},
+      {gnss_unavailable}},
+    AntennaTransformIssueCase{
+      "AvailableInBetweenRestartsTheGracePeriod",
+      {{0ms, "gnss", Lookup::Unavailable},
+       {1s, "gnss", Lookup::Available},
+       {2s, "gnss", Lookup::Unavailable},
+       {beyond_grace_period, "gnss", Lookup::Unavailable}},
+      {}},
+    AntennaTransformIssueCase{
+      "AnotherFrameRestartsTheGracePeriod",
+      {{0ms, "gnss", Lookup::Unavailable}, {beyond_grace_period, "gnss_2", Lookup::Unavailable}},
+      {}},
+    AntennaTransformIssueCase{
+      "RaisedAgainAfterAvailable",
+      {{0ms, "gnss", Lookup::Unavailable},
+       {beyond_grace_period, "gnss", Lookup::Unavailable},
+       {beyond_grace_period + 1s, "gnss", Lookup::Available},
+       {beyond_grace_period + 2s, "gnss", Lookup::Unavailable},
+       {beyond_grace_period + 2s + beyond_grace_period, "gnss", Lookup::Unavailable}},
+      {gnss_unavailable, gnss_unavailable}}),
+  [](const ::testing::TestParamInfo<AntennaTransformIssueCase> & info) {
+    return std::string(info.param.name);
+  });
