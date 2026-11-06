@@ -16,6 +16,7 @@
 
 #include <autoware/geography_utils/height.hpp>
 #include <autoware/geography_utils/projection.hpp>
+#include <builtin_interfaces/msg/time.hpp>
 #include <tf2/LinearMath/Quaternion.hpp>
 #include <tf2/LinearMath/Transform.hpp>
 
@@ -294,17 +295,19 @@ GnssPoser::Result GnssPoser::process_fix(const sensor_msgs::msg::NavSatFix & fix
 
   gnss_antenna_pose.orientation = orientation;
 
-  // get TF from gnss_antenna to base_link. If it cannot be obtained, the antenna pose is published
-  // as the base_link pose, i.e. the identity transform is used (a default-constructed Transform has
-  // zero translation and rotation w = 1).
-  const auto transform = lookup_antenna_to_base_link_(fix.header.frame_id, fix.header.stamp);
+  // get TF from gnss_antenna to base_link. Without it the fix cannot be expressed as a base_link
+  // pose, so it is dropped. The transform is static, so this does not resolve by asking for
+  // another time; it resolves once the transform is published.
+  const auto transform = lookup_antenna_to_base_link_(fix.header.frame_id);
   if (!transform.has_value()) {
-    record_lookup_failure(fix.header.frame_id, fix.header.stamp);
-  } else {
-    clear_lookup_failure();
+    record_lookup_failure(fix.header.frame_id, transform.error(), fix.header.stamp);
+
+    return {
+      Outcome::TransformLookupFailed, make_gnss_fixed(fix.header.stamp, true), std::nullopt,
+      std::nullopt, std::nullopt};
   }
-  const geometry_msgs::msg::Transform antenna_to_base_link =
-    transform.value_or(geometry_msgs::msg::Transform{});
+  clear_lookup_failure();
+  const geometry_msgs::msg::Transform antenna_to_base_link = transform.value();
 
   std::array<double, 3> rotation_variances{};
   if (params_.use_gnss_ins_orientation) {
@@ -336,10 +339,13 @@ GnssPoser::Result GnssPoser::process_fix(const sensor_msgs::msg::NavSatFix & fix
 }
 
 void GnssPoser::record_lookup_failure(
-  const std::string & frame, const builtin_interfaces::msg::Time & stamp)
+  const std::string & frame, const TransformLookupError error,
+  const builtin_interfaces::msg::Time & stamp)
 {
-  if (!transform_lookup_failure_.has_value() || transform_lookup_failure_.value().frame != frame) {
-    transform_lookup_failure_ = TransformLookupFailure{frame, to_stamp_time(stamp)};
+  if (
+    !transform_lookup_failure_.has_value() || transform_lookup_failure_.value().frame != frame ||
+    transform_lookup_failure_.value().error != error) {
+    transform_lookup_failure_ = TransformLookupFailure{frame, error, to_stamp_time(stamp)};
   }
 }
 
@@ -362,11 +368,24 @@ void GnssPoser::update_issues(const builtin_interfaces::msg::Time & stamp)
 
   if (transform_lookup_failure_.has_value()) {
     TransformLookupFailure & failure = transform_lookup_failure_.value();
-    // Expected right after startup, until the transform is published.
-    if (!failure.raised && now - failure.since > antenna_transform_grace_period) {
+    std::optional<Issue::Cause> cause;
+    switch (failure.error) {
+      case TransformLookupError::Unavailable:
+        // Expected right after startup, until the transform is published.
+        if (now - failure.since > antenna_transform_grace_period) {
+          cause = Issue::Cause::TransformUnavailable;
+        }
+        break;
+
+      case TransformLookupError::Failed:
+        cause = Issue::Cause::TransformLookupFailed;
+        break;
+    }
+
+    if (!failure.raised && cause.has_value()) {
       failure.raised = true;
       if (on_issue_raised_) {
-        on_issue_raised_({Issue::Cause::TransformUnavailable, failure.frame});
+        on_issue_raised_({cause.value(), failure.frame});
       }
     }
   }
