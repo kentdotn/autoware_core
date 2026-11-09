@@ -237,13 +237,7 @@ GnssPoser::Result GnssPoser::input_fix(const sensor_msgs::msg::NavSatFix & fix)
   if (!update_stamp_continuity(fix.header.stamp)) {
     clear_lookup_failure();
   }
-  const Result result = process_fix(fix);
-  update_issues();
-  return result;
-}
 
-GnssPoser::Result GnssPoser::process_fix(const sensor_msgs::msg::NavSatFix & fix)
-{
   // Return immediately if map_projector_info has not been received yet.
   if (!received_map_projector_info_) {
     return {Outcome::NoProjectorInfo, std::nullopt, std::nullopt, std::nullopt, std::nullopt};
@@ -355,28 +349,22 @@ void GnssPoser::record_lookup_failure(
 {
   const StampTime now = to_stamp_time(stamp);
   if (!transform_lookup_failure_.has_value() || transform_lookup_failure_.value().frame != frame) {
-    transform_lookup_failure_ = TransformLookupFailure{frame, now, now};
+    transform_lookup_failure_ = TransformLookupFailure{frame, now};
   }
-  transform_lookup_failure_.value().last = now;
+
+  TransformLookupFailure & failure = transform_lookup_failure_.value();
+  // Expected right after startup, until the transform is published.
+  if (!failure.raised && now - failure.since > antenna_transform_grace_period) {
+    failure.raised = true;
+    if (on_issue_raised_) {
+      on_issue_raised_({Issue::Cause::TransformUnavailable, failure.frame});
+    }
+  }
 }
 
 void GnssPoser::clear_lookup_failure()
 {
   transform_lookup_failure_.reset();
-}
-
-void GnssPoser::update_issues()
-{
-  if (transform_lookup_failure_.has_value()) {
-    TransformLookupFailure & failure = transform_lookup_failure_.value();
-    // Expected right after startup, until the transform is published.
-    if (!failure.raised && failure.last - failure.since > antenna_transform_grace_period) {
-      failure.raised = true;
-      if (on_issue_raised_) {
-        on_issue_raised_({Issue::Cause::TransformUnavailable, failure.frame});
-      }
-    }
-  }
 }
 
 }  // namespace autoware::gnss_poser
