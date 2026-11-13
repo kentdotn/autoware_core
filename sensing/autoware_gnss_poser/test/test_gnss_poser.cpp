@@ -28,6 +28,7 @@
 #include <autoware/geography_utils/projection.hpp>
 #include <tf2/LinearMath/Matrix3x3.hpp>
 #include <tf2/LinearMath/Quaternion.hpp>
+#include <tl_expected/expected.hpp>
 
 #include <autoware_map_msgs/msg/map_projector_info.hpp>
 #include <autoware_sensing_msgs/msg/gnss_ins_orientation.hpp>
@@ -44,6 +45,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <optional>
 #include <stdexcept>
@@ -62,6 +64,9 @@ using geometry_msgs::msg::Quaternion;
 using geometry_msgs::msg::Transform;
 using sensor_msgs::msg::NavSatFix;
 using sensor_msgs::msg::NavSatStatus;
+using TransformLookupError = GnssPoser::TransformLookupError;
+using std::chrono_literals::operator""ms;
+using std::chrono_literals::operator""s;
 
 // ---------------------------------------------------------------------------------------
 // Reference input used throughout (same point as autoware_geography_utils' own tests).
@@ -404,10 +409,10 @@ void expect_rotation_variances_near(
   EXPECT_NEAR(covariance[cov_yaw_yaw], yaw, rmse_squared_tolerance);
 }
 
-// The fixes of these cases carry the frame `gnss`, for which the node had no transform and
-// composed with the identity; the lookup that stands in for TF provides the identity directly.
+// The lookup that stands in for TF provides the identity, so that the cases taken from the node
+// characterization stay about what they check rather than about the antenna transform.
 const GnssPoser::TransformLookup identity_lookup = [](const std::string &) {
-  return std::optional<Transform>(Transform{});
+  return tl::expected<Transform, TransformLookupError>(Transform{});
 };
 
 // A GnssPoser that has received the MGRS projector info.
@@ -494,6 +499,92 @@ struct CovarianceType
 };
 
 class GnssPoserKnownCovarianceType : public ::testing::TestWithParam<CovarianceType>
+{
+};
+
+// A failed antenna transform lookup.
+struct MissingTransformCase
+{
+  const char * name;
+  TransformLookupError error;
+};
+
+class GnssPoserMissingTransform : public ::testing::TestWithParam<MissingTransformCase>
+{
+};
+
+constexpr std::chrono::milliseconds grace_period =
+  autoware::gnss_poser::antenna_transform_grace_period;
+constexpr std::chrono::milliseconds beyond_grace_period = grace_period + 1ms;
+// Fixes arrive once a second, as from a 1 Hz receiver.
+constexpr std::chrono::milliseconds fix_interval = 1s;
+
+// The inputs for the fixes of a span: what the receiver reports and what the antenna transform
+// lookup gives.
+enum class InputCondition {
+  // Fixed, and the transform is there, as once /tf_static has been received.
+  TransformAvailable,
+  // Fixed, but the transform is not there yet, as right after startup before /tf_static arrives.
+  TransformUnavailable,
+  // Fixed, and TF has the frames, but the lookup fails anyway.
+  TransformLookupFailed,
+  // The receiver reports no fix (e.g. in a tunnel), so GnssPoser drops the fix before the lookup.
+  // As the first fix, it still starts the grace period.
+  NotFixed
+};
+
+// Fixes from the first one for `duration`, every fix_interval and one at `duration`, all in the
+// same input condition.
+struct ReceivedFixes
+{
+  std::chrono::milliseconds duration;
+  InputCondition condition;
+};
+
+// A sequence of fixes and the antenna transform errors they should report, in order.
+struct AntennaTransformMissingCase
+{
+  const char * name;
+  std::vector<ReceivedFixes> fixes;
+  std::vector<TransformLookupError> reported;
+};
+
+// `stamp` advanced by `offset`.
+builtin_interfaces::msg::Time stamp_after(
+  const builtin_interfaces::msg::Time & stamp, const std::chrono::nanoseconds offset)
+{
+  const std::chrono::nanoseconds time =
+    std::chrono::seconds(stamp.sec) + std::chrono::nanoseconds(stamp.nanosec) + offset;
+  const std::chrono::seconds sec = std::chrono::floor<std::chrono::seconds>(time);
+  builtin_interfaces::msg::Time advanced;
+  advanced.sec = static_cast<int32_t>(sec.count());
+  advanced.nanosec = static_cast<uint32_t>((time - sec).count());
+  return advanced;
+}
+
+// The fixes `received` describes, the first one stamped `start` after the reference fix.
+std::vector<NavSatFix> make_received_fixes(
+  const ReceivedFixes & received, const std::chrono::milliseconds start)
+{
+  NavSatStatus::_status_type status = NavSatStatus::STATUS_FIX;
+  if (received.condition == InputCondition::NotFixed) {
+    status = NavSatStatus::STATUS_NO_FIX;
+  }
+  NavSatFix fix = make_reference_fix(status);
+  const builtin_interfaces::msg::Time reference_stamp = fix.header.stamp;
+
+  std::vector<NavSatFix> fixes;
+  for (std::chrono::milliseconds after = 0ms; after < received.duration; after += fix_interval) {
+    fix.header.stamp = stamp_after(reference_stamp, start + after);
+    fixes.push_back(fix);
+  }
+  fix.header.stamp = stamp_after(reference_stamp, start + received.duration);
+  fixes.push_back(fix);
+  return fixes;
+}
+
+class GnssPoserAntennaTransformMissing
+: public ::testing::TestWithParam<AntennaTransformMissingCase>
 {
 };
 }  // namespace
@@ -1156,3 +1247,202 @@ TEST(GnssPoser, Covariance_UnknownType_PositionVariancesAreTen)
     }
   }
 }
+
+// =======================================================================================
+// 6. Antenna transform
+// =======================================================================================
+
+// Without the antenna transform the fix cannot be expressed as a base_link pose, so it is dropped.
+// The receiver had a position solution, so its status is still reported. Either lookup error gives
+// the same outcome; Result::antenna_transform_error tells whether the transform may still become
+// available.
+TEST_P(GnssPoserMissingTransform, Tf_MissingTransform_PublishesOnlyGnssFixed)
+{
+  // Arrange
+  const TransformLookupError error = GetParam().error;
+  GnssPoser poser(
+    {}, [error](const std::string &) -> tl::expected<Transform, TransformLookupError> {
+      return tl::unexpected(error);
+    });
+  poser.set_projector_info(make_mgrs_projector_info());
+
+  // Act
+  const auto result = poser.input_fix(make_reference_fix());
+
+  // Assert
+  EXPECT_EQ(result.outcome, GnssPoser::Outcome::TransformLookupFailed);
+  expect_only_gnss_fixed(result);
+  EXPECT_TRUE(result.gnss_fixed.value().data);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  LookupErrors, GnssPoserMissingTransform,
+  ::testing::Values(
+    MissingTransformCase{"Unavailable", TransformLookupError::Unavailable},
+    MissingTransformCase{"Failed", TransformLookupError::Failed}),
+  [](const ::testing::TestParamInfo<MissingTransformCase> & info) {
+    return std::string(info.param.name);
+  });
+
+// A fix dropped for lack of the transform has still been observed: it stays in the position
+// buffer, so the average once the transform is available includes it.
+TEST(GnssPoser, Tf_MissingTransform_FixStaysInPositionBuffer)
+{
+  // Arrange
+  // no transform until it is assigned
+  tl::expected<Transform, TransformLookupError> available =
+    tl::unexpected(TransformLookupError::Unavailable);
+  GnssPoser poser(
+    make_buffer_params(1, 2), [&available](const std::string &) { return available; });
+  poser.set_projector_info(make_mgrs_projector_info());
+  const auto fixes = make_average_fixes();
+  input_fixes(poser, {fixes[0], fixes[1]});
+  available = Transform{};
+
+  // Act
+  const auto result = poser.input_fix(fixes[2]);
+
+  // Assert
+  expect_point_near(
+    pose_of(result).position, mean_of({project_mgrs(fixes[1]), project_mgrs(fixes[2])}));
+}
+
+// Likewise a dropped fix is the previous position of the motion heading: the first fix with the
+// transform heads along the step from the last dropped fix, not from an older one.
+TEST(GnssPoser, Tf_MissingTransform_FixAdvancesMotionHeading)
+{
+  // Arrange
+  GnssPoserParams params;
+  params.gnss_pose_pub_method = GnssPosePubMethod::Instant;
+  params.use_gnss_ins_orientation = false;
+  // no transform until it is assigned
+  tl::expected<Transform, TransformLookupError> available =
+    tl::unexpected(TransformLookupError::Unavailable);
+  GnssPoser poser(params, [&available](const std::string &) { return available; });
+  poser.set_projector_info(make_mgrs_projector_info());
+  const auto fixes = make_motion_fixes();
+  input_fixes(poser, {fixes[0], fixes[1]});
+  available = Transform{};
+  const auto p2 = project_mgrs(fixes[1]);
+  const auto p3 = project_mgrs(fixes[2]);
+
+  // Act
+  const auto result = poser.input_fix(fixes[2]);
+
+  // Assert
+  EXPECT_NEAR(
+    yaw_of(pose_of(result).orientation), std::atan2(p3.y - p2.y, p3.x - p2.x), angle_tolerance);
+}
+
+// A missing antenna transform is expected right after startup, so an unavailable one is reported
+// only by a fix after the grace period, measured by the fix stamps from the first fix of all; a
+// failed lookup is reported at once. Each is reported once, at the first such fix, and again only
+// after a fix has got the transform; the two errors are reported independently.
+TEST_P(GnssPoserAntennaTransformMissing, InputFix_AfterFixes_ReportsEachOutageOnce)
+{
+  // Arrange
+  InputCondition condition = InputCondition::TransformAvailable;
+  GnssPoser poser(
+    {}, [&condition](const std::string &) -> tl::expected<Transform, TransformLookupError> {
+      if (condition == InputCondition::TransformUnavailable) {
+        return tl::unexpected(TransformLookupError::Unavailable);
+      }
+      if (condition == InputCondition::TransformLookupFailed) {
+        return tl::unexpected(TransformLookupError::Failed);
+      }
+      return Transform{};
+    });
+  poser.set_projector_info(make_mgrs_projector_info());
+
+  // Act
+  // Each span starts fix_interval after the last fix of the previous one.
+  std::vector<TransformLookupError> reported;
+  std::optional<std::chrono::milliseconds> last;
+  for (const ReceivedFixes & received : GetParam().fixes) {
+    // The lookup above answers the fixes of this span by their input condition.
+    condition = received.condition;
+
+    const std::chrono::milliseconds start = last.has_value() ? last.value() + fix_interval : 0ms;
+    for (const NavSatFix & fix : make_received_fixes(received, start)) {
+      const auto error = poser.input_fix(fix).antenna_transform_error;
+      if (error.has_value()) {
+        reported.push_back(error.value());
+      }
+    }
+    last = start + received.duration;
+  }
+
+  // Assert
+  EXPECT_EQ(reported, GetParam().reported);
+}
+
+constexpr TransformLookupError unavailable = TransformLookupError::Unavailable;
+constexpr TransformLookupError failed = TransformLookupError::Failed;
+
+// Each case lists spans of fixes {duration, input condition}, one after another, stamped
+// fix_interval (1 s) apart.
+INSTANTIATE_TEST_SUITE_P(
+  FixSequences, GnssPoserAntennaTransformMissing,
+  ::testing::Values(
+    // Unavailable for just the grace period (5 s) from the first fix: not reported.
+    AntennaTransformMissingCase{
+      "UnavailableForTheGracePeriod", {{grace_period, InputCondition::TransformUnavailable}}, {}},
+    // Unavailable for just past the grace period: reported at the last fix.
+    AntennaTransformMissingCase{
+      "UnavailableBeyondTheGracePeriod",
+      {{beyond_grace_period, InputCondition::TransformUnavailable}},
+      {unavailable}},
+    // As above, 1 s longer: reported once, not again by the fixes after that.
+    AntennaTransformMissingCase{
+      "StillUnavailableAfterReported",
+      {{beyond_grace_period + 1s, InputCondition::TransformUnavailable}},
+      {unavailable}},
+    // Available through the grace period, then one unavailable fix: past the grace period from the
+    // first fix, so it is reported at once.
+    AntennaTransformMissingCase{
+      "UnavailableAfterTheGracePeriodReportedAtOnce",
+      {{grace_period, InputCondition::TransformAvailable},
+       {0s, InputCondition::TransformUnavailable}},
+      {unavailable}},
+    // Not fixed through the grace period, then one unavailable fix: the not fixed fixes are the
+    // first ones, so the grace period has passed and it is reported at once.
+    AntennaTransformMissingCase{
+      "NotFixedFirstStartsTheGracePeriod",
+      {{grace_period, InputCondition::NotFixed}, {0s, InputCondition::TransformUnavailable}},
+      {unavailable}},
+    // Unavailable past the grace period (reported), one available fix, then one unavailable fix:
+    // reported a second time.
+    AntennaTransformMissingCase{
+      "ReportedAgainAfterAvailable",
+      {{beyond_grace_period, InputCondition::TransformUnavailable},
+       {0s, InputCondition::TransformAvailable},
+       {0s, InputCondition::TransformUnavailable}},
+      {unavailable, unavailable}},
+    // One fix whose lookup fails: reported at once, without the grace period.
+    AntennaTransformMissingCase{
+      "FailedAtOnce", {{0s, InputCondition::TransformLookupFailed}}, {failed}},
+    // Unavailable past the grace period (reported), then one fix whose lookup fails: that is
+    // reported too.
+    AntennaTransformMissingCase{
+      "UnavailableThenFailed",
+      {{beyond_grace_period, InputCondition::TransformUnavailable},
+       {0s, InputCondition::TransformLookupFailed}},
+      {unavailable, failed}},
+    // As above, then the two errors once more each: each has been reported, so neither is again.
+    AntennaTransformMissingCase{
+      "AlternatingErrorsReportedOnceEach",
+      {{beyond_grace_period, InputCondition::TransformUnavailable},
+       {0s, InputCondition::TransformLookupFailed},
+       {0s, InputCondition::TransformUnavailable},
+       {0s, InputCondition::TransformLookupFailed}},
+      {unavailable, failed}},
+    // Failed, available, failed again, one fix each: reported each time.
+    AntennaTransformMissingCase{
+      "FailedAgainAfterAvailable",
+      {{0s, InputCondition::TransformLookupFailed},
+       {0s, InputCondition::TransformAvailable},
+       {0s, InputCondition::TransformLookupFailed}},
+      {failed, failed}}),
+  [](const ::testing::TestParamInfo<AntennaTransformMissingCase> & info) {
+    return std::string(info.param.name);
+  });

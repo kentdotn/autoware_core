@@ -63,6 +63,7 @@
 #include <exception>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <stdexcept>
 #include <string>
@@ -168,10 +169,12 @@ builtin_interfaces::msg::Time fix_stamp()
   return make_stamp(fix_stamp_sec, fix_stamp_nanosec);
 }
 
+// Fixes are stamped in base_link itself unless a case says otherwise, so the node needs no antenna
+// transform for them: a fix whose transform is missing is dropped.
 NavSatFix make_fix(
   double latitude, double longitude, double altitude,
   NavSatStatus::_status_type status = NavSatStatus::STATUS_FIX,
-  const std::string & frame_id = "gnss")
+  const std::string & frame_id = "base_link")
 {
   NavSatFix msg;
   msg.header.stamp = fix_stamp();
@@ -188,7 +191,7 @@ NavSatFix make_fix(
 
 NavSatFix make_reference_fix(
   NavSatStatus::_status_type status = NavSatStatus::STATUS_FIX,
-  const std::string & frame_id = "gnss")
+  const std::string & frame_id = "base_link")
 {
   return make_fix(reference_latitude, reference_longitude, reference_altitude, status, frame_id);
 }
@@ -509,12 +512,15 @@ protected:
   // Waits until `gnss_fixed` has been received `count` times. The node publishes it for every fix
   // that passes the projector gates, fixed or not, so it marks that fix as processed. Then pumps
   // for one more delivery budget so that the remaining outputs of the same callback, if any, have
-  // landed before a count is asserted.
-  void wait_for_gnss_fixed(std::size_t count)
+  // landed before a count is asserted. Returns the latest `gnss_fixed`, or std::nullopt when fewer
+  // than `count` arrived within the wait budget.
+  std::optional<BoolStamped> wait_for_gnss_fixed(std::size_t count)
   {
-    ASSERT_TRUE(pump_until([this, count] { return peer_->fixed_flags.size() >= count; }))
-      << "expected " << count << " gnss_fixed messages, got " << peer_->fixed_flags.size();
+    if (!pump_until([this, count] { return peer_->fixed_flags.size() >= count; })) {
+      return std::nullopt;
+    }
     pump(delivery_budget);
+    return peer_->fixed_flags.back();
   }
 
   // Waits until every output of an accepted fix (gnss_fixed, gnss_pose, gnss_pose_cov and the
@@ -615,7 +621,9 @@ protected:
     for (const auto & fix : fixes) {
       const std::size_t processed = peer_->fixed_flags.size();
       send_fix(fix);
-      ASSERT_NO_FATAL_FAILURE(wait_for_gnss_fixed(processed + 1));
+      ASSERT_TRUE(wait_for_gnss_fixed(processed + 1).has_value())
+        << "expected " << processed + 1 << " gnss_fixed messages, got "
+        << peer_->fixed_flags.size();
     }
   }
 
@@ -1018,29 +1026,43 @@ TEST_F(GnssPoserNodeIntegration, Tf_StaticAntennaToBaseTransform_IsComposedAndBr
   EXPECT_EQ(peer_->broadcast_tfs.size(), 1U);
 }
 
-// The antenna frame is the fix's `header.frame_id`. A frame with no transform to base_frame, or a
-// frame equal to base_frame, yields the antenna pose unchanged (identity fallback); a known frame
-// gets the transform applied.
-//
-// NOTE(characterization): the unknown-frame case is a configuration error (the driver's frame_id
-// does not match any TF frame) that never resolves by waiting, yet the node keeps publishing the
-// antenna position as base_link, with the receiver's covariance and only a throttled warning. The
-// node does not distinguish this from a transform that is merely not available yet. The
-// frame_id == base_frame shortcut, by contrast, is a legitimate configuration.
-TEST_F(GnssPoserNodeIntegration, Tf_AntennaFrameComesFromFixHeader_UnknownFrameFallsBackToIdentity)
+// The antenna frame is the fix's `header.frame_id`. A frame with no transform to base_frame drops
+// the fix: the pose cannot be expressed in base_link, and `gnss_fixed` still reports the receiver's
+// status. A frame equal to base_frame needs no lookup and yields the antenna pose unchanged; a
+// known frame gets the transform applied.
+TEST_F(GnssPoserNodeIntegration, Tf_AntennaFrameComesFromFixHeader_UnknownFrameDropsTheFix)
 {
   // Arrange
   ASSERT_NO_FATAL_FAILURE(build_node_with_static_antenna_tf());
   const auto fix_unknown = make_reference_fix(NavSatStatus::STATUS_FIX, "some_other_antenna");
 
   // Act
-  // Frame from the header is what gets looked up; a frame without TF yields the antenna pose.
+  // Frame from the header is what gets looked up; a frame without TF drops the fix.
   send_fix(fix_unknown);
 
   // Assert
-  ASSERT_NO_FATAL_FAILURE(wait_for_outputs(1));
-  expect_point_near(last_pose().pose.position, project_mgrs(fix_unknown));
-  EXPECT_NEAR(yaw_of(last_pose().pose.orientation), M_PI / 2.0, angle_tolerance);
+  const auto fixed = wait_for_gnss_fixed(1);
+  ASSERT_TRUE(fixed.has_value()) << "gnss_fixed did not arrive";
+  expect_output_counts(1, 0, 0, 0);
+  EXPECT_TRUE(fixed->data);
+}
+
+// A fix dropped for lack of the antenna transform is not replayed once the transform arrives.
+TEST_F(GnssPoserNodeIntegration, Tf_AntennaTransformArrivesAfterDroppedFix_PublishesNothing)
+{
+  // Arrange
+  NodeParams params;
+  params.base_frame = "my_base";
+  ASSERT_NO_FATAL_FAILURE(build_node_with_mgrs_projector(params));
+  send_fix(make_antenna_fix_at(make_stamp(1000, 0)));
+  ASSERT_TRUE(wait_for_gnss_fixed(1).has_value()) << "gnss_fixed did not arrive";
+
+  // Act
+  ASSERT_NO_FATAL_FAILURE(broadcast_static_tf(
+    "my_antenna", "my_base", make_point(1.0, 2.0, 0.5), yaw_to_quaternion(0.0)));
+
+  // Assert
+  expect_output_counts(1, 0, 0, 0);
 }
 
 TEST_F(GnssPoserNodeIntegration, Tf_AntennaFrameComesFromFixHeader_BaseFrameUsesIdentity)
