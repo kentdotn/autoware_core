@@ -302,9 +302,11 @@ GnssPoser::Result GnssPoser::input_fix(const sensor_msgs::msg::NavSatFix & fix)
       break;
 
     case OrientationSource::Motion:
+      // The first position has no previous one to give it a heading.
       if (!has_prev_position_) {
         prev_position_ = gnss_antenna_pose.position;
         has_prev_position_ = true;
+        return {Outcome::NoOrientation, make_gnss_fixed(fix.header.stamp, true)};
       }
       orientation =
         get_quaternion_by_position_difference(gnss_antenna_pose.position, prev_position_);
